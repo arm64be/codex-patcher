@@ -1307,7 +1307,12 @@ mod tests {
         fs::create_dir(bin.join("nested")).unwrap();
 
         let selected = deduplicate_surface_paths(aliases).unwrap();
-        assert_eq!(selected, vec![bin.join("codex")]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].parent(),
+            Some(bin.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(selected[0].file_name(), Some(std::ffi::OsStr::new("codex")));
     }
 
     #[cfg(unix)]

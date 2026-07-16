@@ -2753,8 +2753,7 @@ fn macos_acl_text(path: &Path, no_follow: bool) -> Result<Option<Vec<u8>>> {
     };
     if acl.is_null() {
         let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(code) if code == libc::ENOENT || code == libc::ENOATTR)
-        {
+        if macos_acl_is_absent(&error) {
             return Ok(None);
         }
         return Err(error).with_context(|| format!("read ACL for {}", path.display()));
@@ -2792,8 +2791,7 @@ fn restore_macos_acl(path: &Path, no_follow: bool, text: Option<&[u8]>) -> Resul
         };
         if result != 0 {
             let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(code) if code == libc::ENOENT || code == libc::ENOATTR)
-            {
+            if !macos_acl_is_absent(&error) {
                 return Err(error).with_context(|| format!("remove ACL from {}", path.display()));
             }
         }
@@ -2821,6 +2819,14 @@ fn restore_macos_acl(path: &Path, no_follow: bool, text: Option<&[u8]>) -> Resul
             .with_context(|| format!("restore ACL for {}", path.display()));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_acl_is_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::ENOENT || code == libc::ENOATTR || code == libc::ENOTSUP
+    )
 }
 
 #[cfg(windows)]
