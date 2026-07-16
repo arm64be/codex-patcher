@@ -18,11 +18,12 @@ use codex_patcher::shim::{
 };
 use codex_patcher::state::{InstallState, StateStore};
 use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
+use directories::BaseDirs;
 use fs2::FileExt;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(not(windows))]
@@ -37,6 +38,12 @@ struct ManagerCli {
 
 #[derive(Debug, Subcommand)]
 enum ManagerCommand {
+    /// Create a starter patch directory under CODEX_HOME/codex-patcher.
+    Quickstart {
+        /// Overwrite the starter files if they already exist.
+        #[arg(long)]
+        force: bool,
+    },
     /// Build the first patched generation and take over selected Codex launchers.
     Install {
         patch_dir: PathBuf,
@@ -109,6 +116,7 @@ fn real_main() -> Result<()> {
     }
 
     match ManagerCli::parse().command {
+        ManagerCommand::Quickstart { force } => quickstart(force),
         ManagerCommand::Install {
             patch_dir,
             surfaces,
@@ -135,6 +143,114 @@ fn real_main() -> Result<()> {
         ManagerCommand::Gc => gc(&paths),
         ManagerCommand::InternalProbe => probe::run_internal(&paths),
     }
+}
+
+const QUICKSTART_CONFIG: &str = r#"schema = 1
+branch = "stable"
+target = "official-native"
+failure_mode = "error"
+noninteractive_pending = "auto"
+"#;
+
+const QUICKSTART_SERIES: &str = "status-line.patch\n";
+
+const QUICKSTART_STATUS_PATCH: &str = r#"diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -744,6 +744,7 @@ impl StatusCard {
+         if self.model_provider.is_some() {
+             push_label(&mut labels, &mut seen, "Model provider");
+         }
++        push_label(&mut labels, &mut seen, "Codex Patcher");
+         if account_value.is_some() {
+             push_label(&mut labels, &mut seen, "Account");
+         }
+@@ -831,6 +832,10 @@ impl StatusCard {
+         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
+         lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
+         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
++        lines.push(formatter.line(
++            "Codex Patcher",
++            vec![Span::from("quickstart patch is in")],
++        ));
+ 
+         if let Some(account_value) = account_value {
+             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
+"#;
+
+const QUICKSTART_AGENTS: &str = r#"# codex-patcher Patch Directory
+
+This directory is managed by codex-patcher: https://github.com/arm64be/codex-patcher
+
+Keep `codex-patcher.toml`, `series`, and every `*.patch` file in this directory
+small and reviewable. The `series` file is the patch order; list every patch
+there, one relative path per line.
+
+Use this workflow:
+
+1. Edit or add patch files here.
+2. Run `codex-patcher update --retry` to rebuild the patched Codex generation.
+3. Run `/status` in Codex and check the `Codex Patcher` line when using the
+   starter patch.
+
+Avoid symlinks, absolute paths, path traversal, duplicate patch names, and
+case-only filename differences. codex-patcher rejects those inputs so the same
+patch stack behaves consistently across Linux, macOS, and Windows.
+"#;
+
+fn quickstart(force: bool) -> Result<()> {
+    let patch_dir = quickstart_patch_dir()?;
+    write_quickstart(&patch_dir, force)?;
+    println!(
+        "created quickstart patch directory: {}",
+        patch_dir.display()
+    );
+    println!("next: codex-patcher install {}", patch_dir.display());
+    Ok(())
+}
+
+fn quickstart_patch_dir() -> Result<PathBuf> {
+    let codex_home = match std::env::var_os("CODEX_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => BaseDirs::new()
+            .context("locating home directory for default CODEX_HOME")?
+            .home_dir()
+            .join(".codex"),
+    };
+    Ok(codex_home.join("codex-patcher"))
+}
+
+fn write_quickstart(patch_dir: &Path, force: bool) -> Result<()> {
+    fs::create_dir_all(patch_dir)
+        .with_context(|| format!("creating patch directory {}", patch_dir.display()))?;
+    write_quickstart_file(
+        &patch_dir.join("codex-patcher.toml"),
+        QUICKSTART_CONFIG,
+        force,
+    )?;
+    write_quickstart_file(&patch_dir.join("series"), QUICKSTART_SERIES, force)?;
+    write_quickstart_file(
+        &patch_dir.join("status-line.patch"),
+        QUICKSTART_STATUS_PATCH,
+        force,
+    )?;
+    write_quickstart_file(&patch_dir.join("AGENTS.md"), QUICKSTART_AGENTS, force)?;
+    Config::load(patch_dir.join("codex-patcher.toml"))?;
+    PatchSet::load(patch_dir)?;
+    Ok(())
+}
+
+fn write_quickstart_file(path: &Path, contents: &str, force: bool) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(force);
+    if !force {
+        options.create_new(true);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn finish(code: i32) -> Result<()> {
@@ -1234,5 +1350,25 @@ mod tests {
         assert!(generation_in_use(&paths, &generation));
         FileExt::unlock(&lease).unwrap();
         assert!(!generation_in_use(&paths, &generation));
+    }
+
+    #[test]
+    fn quickstart_writes_a_valid_patch_directory_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let patch_dir = temp.path().join("codex-home/codex-patcher");
+
+        write_quickstart(&patch_dir, false).unwrap();
+        Config::load(patch_dir.join("codex-patcher.toml")).unwrap();
+        let set = PatchSet::load(&patch_dir).unwrap();
+        assert_eq!(set.patches.len(), 1);
+        assert_eq!(set.patches[0].path, "status-line.patch");
+        assert!(
+            fs::read_to_string(patch_dir.join("AGENTS.md"))
+                .unwrap()
+                .contains("https://github.com/arm64be/codex-patcher")
+        );
+
+        assert!(write_quickstart(&patch_dir, false).is_err());
+        write_quickstart(&patch_dir, true).unwrap();
     }
 }

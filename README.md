@@ -15,14 +15,16 @@ upstream Codex package builder. Builds are native on Linux, macOS, and Windows,
 including x86-64 and ARM64 runners.
 
 ```sh
-cargo build --release --locked
-target/release/codex-patcher scan
-target/release/codex-patcher install /path/to/patch-directory
+cargo install --git https://github.com/arm64be/codex-patcher --locked
+codex-patcher quickstart
+codex-patcher scan
+codex-patcher install "${CODEX_HOME:-$HOME/.codex}/codex-patcher"
 ```
 
 `install` builds and validates the patched Codex package before it changes a
 launcher. Keep the `codex-patcher` management binary somewhere outside the
-launcher paths you select.
+launcher paths you select. If `CODEX_HOME` is unset, `quickstart` uses
+`~/.codex/codex-patcher`.
 
 ## Patch Directory
 
@@ -58,6 +60,11 @@ regular `*.patch` files are applied recursively in bytewise path order.
 Codex Patcher rejects absolute paths, traversal, symlinks, duplicates,
 case-folding collisions, missing files, and unlisted patches.
 
+`quickstart` creates a patch directory with a default config, a `series` file,
+an `AGENTS.md`, and one example patch. The example adds a `Codex Patcher` line
+to Codex's `/status` screen so you can confirm the patched generation is the one
+running.
+
 ## How Launches Work
 
 There is no daemon or watcher. A wrapped `codex` launch does three small things:
@@ -84,6 +91,7 @@ generations.
 Run management commands through the unwrapped `codex-patcher` binary:
 
 ```sh
+codex-patcher quickstart [--force]
 codex-patcher scan
 codex-patcher status
 codex-patcher update [--retry] [--accept-retag] [--accept-force-push]

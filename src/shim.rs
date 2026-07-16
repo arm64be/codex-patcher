@@ -2372,12 +2372,6 @@ fn set_metadata_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    #[link_name = "lchmod"]
-    fn macos_lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
-}
-
 fn capture_security_metadata(path: &Path, _metadata: &Metadata) -> Result<SecurityMetadata> {
     let mut security = SecurityMetadata::default();
     #[cfg(unix)]
@@ -2443,20 +2437,10 @@ fn restore_security_metadata(
     // Ownership changes can clear set-id bits, and ACL installation can alter
     // the POSIX mode mask. Restore the ordinary mode/attributes last without
     // ever following a symlink into its target.
-    #[cfg(target_os = "macos")]
-    if _no_follow && let Some(mode) = mode {
-        let path_c = unix_path(path)?;
-        // SAFETY: path_c is live and lchmod operates on the link itself.
-        if unsafe { macos_lchmod(path_c.as_ptr(), mode as libc::mode_t) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("restore symlink mode for {}", path.display()));
-        }
-        return Ok(());
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     if _no_follow {
-        // Linux symlink permissions are invariant and chmod would follow the
-        // target, so uid/gid/xattrs above are the complete restorable state.
+        // Symlink modes are not portable or behaviorally meaningful, and chmod
+        // would follow the link on platforms without a usable lchmod.
         return Ok(());
     }
     set_metadata_mode(path, mode)

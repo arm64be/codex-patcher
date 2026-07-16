@@ -285,8 +285,8 @@ impl StateStore {
 }
 
 fn lock_is_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+    let contended = fs2::lock_contended_error();
+    error.kind() == contended.kind() || error.raw_os_error() == contended.raw_os_error()
 }
 
 pub struct LockGuard {

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Launch-triggered source patcher and dispatcher for the OpenAI Codex CLI"
+repository = "https://github.com/arm64be/codex-patcher"
+readme = "README.md"
+
+[[bin]]
+name = "codex-patcher"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
