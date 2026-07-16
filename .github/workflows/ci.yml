@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_upstream_build:
+        description: Build and validate one complete upstream Codex package
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format and clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: rustfmt --edition 2024 --check tests/fixtures/process_helper.rs
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  native-tests:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - name: macOS x86-64
+            runner: macos-15-intel
+          - name: macOS ARM64
+            runner: macos-15
+          - name: Windows x86-64
+            runner: windows-2025
+          - name: Windows ARM64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets --locked
+
+  full-upstream-package:
+    name: Opt-in full upstream package smoke test
+    if: github.event_name == 'workflow_dispatch' && inputs.full_upstream_build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang git pkg-config python3
+      - run: cargo build --release --locked
+      - name: Build, take over, launch, detect ownership, and uninstall
+        shell: bash
+        env:
+          CODEX_PATCHER_HOME: ${{ runner.temp }}/codex-patcher-home
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/patches" "${RUNNER_TEMP}/surface"
+          printf '%s\n' \
+            'schema = 1' \
+            'branch = "stable"' \
+            'target = "x86_64-unknown-linux-gnu"' \
+            'failure_mode = "error"' \
+            'noninteractive_pending = "auto"' \
+            > "${RUNNER_TEMP}/patches/codex-patcher.toml"
+          printf '#!/bin/sh\nexit 0\n' > "${RUNNER_TEMP}/surface/codex"
+          chmod +x "${RUNNER_TEMP}/surface/codex"
+          target/release/codex-patcher install \
+            "${RUNNER_TEMP}/patches" \
+            --surface "${RUNNER_TEMP}/surface/codex" \
+            --yes
+          first_log=$(ls -1t "${CODEX_PATCHER_HOME}/state/logs"/build-*.log | head -1)
+          first_compiled=$(grep -Ec '^[[:space:]]*Compiling ' "${first_log}" || true)
+          printf '%s\n' \
+            'diff --git a/codex-patcher-incremental-smoke.txt b/codex-patcher-incremental-smoke.txt' \
+            'new file mode 100644' \
+            '--- /dev/null' \
+            '+++ b/codex-patcher-incremental-smoke.txt' \
+            '@@ -0,0 +1 @@' \
+            '+second canonical package build reuses compiler artifacts' \
+            > "${RUNNER_TEMP}/patches/incremental.patch"
+          target/release/codex-patcher update --retry
+          second_log=$(ls -1t "${CODEX_PATCHER_HOME}/state/logs"/build-*.log | head -1)
+          second_compiled=$(grep -Ec '^[[:space:]]*Compiling ' "${second_log}" || true)
+          grep -F 'incremental compiler cache: warm; reusing' \
+            "${second_log}"
+          test "${first_compiled}" -gt 0
+          test "${second_compiled}" -lt "${first_compiled}"
+          printf 'incremental evidence: %s -> %s compiling units\n' \
+            "${first_compiled}" "${second_compiled}"
+          "${RUNNER_TEMP}/surface/codex" --version
+          target/release/codex-patcher status | tee "${RUNNER_TEMP}/owned-status.txt"
+          grep -F '[owned]' "${RUNNER_TEMP}/owned-status.txt"
+          rm "${RUNNER_TEMP}/surface/codex"
+          printf '#!/bin/sh\nprintf owner-reinstalled\n' > "${RUNNER_TEMP}/surface/codex"
+          chmod +x "${RUNNER_TEMP}/surface/codex"
+          target/release/codex-patcher status | tee "${RUNNER_TEMP}/drifted-status.txt"
+          grep -F '[overwritten/drifted]' "${RUNNER_TEMP}/drifted-status.txt"
+          target/release/codex-patcher repair-shims --adopt-drift --yes
+          "${RUNNER_TEMP}/surface/codex" --version
+          target/release/codex-patcher uninstall --yes
+          test "$("${RUNNER_TEMP}/surface/codex")" = owner-reinstalled
