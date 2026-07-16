@@ -278,10 +278,15 @@ impl StateStore {
         let file = open_lock(path)?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(LockGuard { file })),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) if lock_is_contended(&error) => Ok(None),
             Err(error) => Err(error).with_context(|| format!("locking {label}")),
         }
     }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 pub struct LockGuard {

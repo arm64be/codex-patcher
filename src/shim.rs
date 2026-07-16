@@ -849,9 +849,7 @@ fn installed_matches_at(surface: &Path, installed: &InstalledShim) -> Result<boo
     {
         return Ok(false);
     }
-    if let Some(expected) = installed.mode
-        && metadata_mode(&metadata) != Some(expected)
-    {
+    if !metadata_mode_matches(&metadata, installed.mode) {
         return Ok(false);
     }
     if let Some(expected) = installed.security.as_ref()
@@ -898,7 +896,7 @@ pub fn baseline_matches_current(surface: &Path, baseline: &BaselineBackup) -> Re
             if fs::read_link(surface).ok() != baseline.symlink_target {
                 return Ok(false);
             }
-            if baseline.mode.is_some() && metadata_mode(&metadata) != baseline.mode {
+            if !metadata_mode_matches(&metadata, baseline.mode) {
                 return Ok(false);
             }
             security_metadata_matches(surface, &metadata, baseline.security.as_ref())
@@ -916,7 +914,7 @@ pub fn baseline_matches_current(surface: &Path, baseline: &BaselineBackup) -> Re
             if sha256_file(surface)? != expected {
                 return Ok(false);
             }
-            if baseline.mode.is_some() && metadata_mode(&metadata) != baseline.mode {
+            if !metadata_mode_matches(&metadata, baseline.mode) {
                 return Ok(false);
             }
             security_metadata_matches(surface, &metadata, baseline.security.as_ref())
@@ -1010,7 +1008,7 @@ fn snapshot_matches_current(surface: &Path, snapshot: &SurfaceSnapshot) -> Resul
             };
             if !metadata.file_type().is_symlink()
                 || fs::read_link(surface).ok() != snapshot.symlink_target
-                || snapshot.mode.is_some() && metadata_mode(&metadata) != snapshot.mode
+                || !metadata_mode_matches(&metadata, snapshot.mode)
             {
                 return Ok(false);
             }
@@ -1026,7 +1024,7 @@ fn snapshot_matches_current(surface: &Path, snapshot: &SurfaceSnapshot) -> Resul
             };
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
-                || snapshot.mode.is_some() && metadata_mode(&metadata) != snapshot.mode
+                || !metadata_mode_matches(&metadata, snapshot.mode)
             {
                 return Ok(false);
             }
@@ -2350,6 +2348,10 @@ fn metadata_mode(metadata: &Metadata) -> Option<u32> {
     }
 }
 
+fn metadata_mode_matches(metadata: &Metadata, expected: Option<u32>) -> bool {
+    expected.is_none_or(|expected| metadata_mode(metadata) == Some(expected))
+}
+
 fn set_metadata_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -2368,6 +2370,12 @@ fn set_metadata_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     #[cfg(not(any(unix, windows)))]
     let _ = (path, mode);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[link_name = "lchmod"]
+    fn macos_lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
 }
 
 fn capture_security_metadata(path: &Path, _metadata: &Metadata) -> Result<SecurityMetadata> {
@@ -2439,7 +2447,7 @@ fn restore_security_metadata(
     if _no_follow && let Some(mode) = mode {
         let path_c = unix_path(path)?;
         // SAFETY: path_c is live and lchmod operates on the link itself.
-        if unsafe { libc::lchmod(path_c.as_ptr(), mode as libc::mode_t) } != 0 {
+        if unsafe { macos_lchmod(path_c.as_ptr(), mode as libc::mode_t) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("restore symlink mode for {}", path.display()));
         }

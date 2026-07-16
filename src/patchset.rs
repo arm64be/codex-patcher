@@ -275,16 +275,32 @@ mod tests {
         assert!(PatchSet::load(root.path()).is_err());
         fs::write(root.path().join("series"), b"../a.patch\n").unwrap();
         assert!(PatchSet::load(root.path()).is_err());
-
-        fs::remove_file(root.path().join("series")).unwrap();
-        fs::write(root.path().join("A.patch"), b"A").unwrap();
+        fs::write(root.path().join("series"), b"a.patch\nA.patch\nb.patch\n").unwrap();
         assert!(PatchSet::load(root.path()).is_err());
 
-        fs::remove_file(root.path().join("A.patch")).unwrap();
+        fs::remove_file(root.path().join("series")).unwrap();
+        if supports_case_distinct_paths(root.path()) {
+            fs::write(root.path().join("A.patch"), b"A").unwrap();
+            assert!(PatchSet::load(root.path()).is_err());
+            fs::remove_file(root.path().join("A.patch")).unwrap();
+        }
+
         fs::create_dir(root.path().join("Series")).unwrap();
         assert!(PatchSet::load(root.path()).is_err());
         assert_eq!(casefold_path("É.patch"), casefold_path("e\u{301}.patch"));
         assert_eq!(casefold_path("Ａ.patch"), casefold_path("a.patch"));
+    }
+
+    fn supports_case_distinct_paths(root: &Path) -> bool {
+        let lower = root.join("case-probe.tmp");
+        let upper = root.join("CASE-PROBE.tmp");
+        fs::write(&lower, b"lower").unwrap();
+        fs::write(&upper, b"upper").unwrap();
+        let distinct = fs::read(&lower).ok().as_deref() == Some(b"lower".as_slice())
+            && fs::read(&upper).ok().as_deref() == Some(b"upper".as_slice());
+        let _ = fs::remove_file(&lower);
+        let _ = fs::remove_file(&upper);
+        distinct
     }
 
     #[cfg(unix)]

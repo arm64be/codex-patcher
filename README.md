@@ -1,10 +1,18 @@
 # Codex Patcher
 
-Keep a local patch stack on the Codex CLI without babysitting rebuilds. Codex Patcher builds complete, validated packages from [OpenAI's Codex source](https://github.com/openai/codex), redirects the `codex` launchers you choose, and atomically switches between immutable patched generations.
+Codex Patcher keeps a local Codex CLI on your own patch stack. It builds Codex
+from [OpenAI's source](https://github.com/openai/codex), applies your patches in
+a repeatable order, validates the result, and then redirects only the launchers
+you choose.
 
-## Quick start
+It is designed for people who want a patched `codex` command without babysitting
+source checkouts, rebuilds, or stale shims.
 
-You need Git, Python 3, Rustup/Cargo, and the native tools required by Codex's upstream package builder. Builds are native-only on Linux, macOS, and Windows (x86-64 and ARM64); Linux defaults to the official MUSL target and may use the matching GNU target.
+## Quick Start
+
+Install Git, Python 3, Rustup/Cargo, and the native build tools required by the
+upstream Codex package builder. Builds are native on Linux, macOS, and Windows,
+including x86-64 and ARM64 runners.
 
 ```sh
 cargo build --release --locked
@@ -12,23 +20,13 @@ target/release/codex-patcher scan
 target/release/codex-patcher install /path/to/patch-directory
 ```
 
-`install` builds and validates Codex before touching anything, then lets you select one or more discovered command surfaces. Keep the resulting `codex-patcher` management command outside those selected paths.
+`install` builds and validates the patched Codex package before it changes a
+launcher. Keep the `codex-patcher` management binary somewhere outside the
+launcher paths you select.
 
-## How launches work
+## Patch Directory
 
-There is no watcher, timer, or repair service. Every wrapped launch:
-
-1. Reads the freshness result saved by an earlier launch.
-2. Starts one detached, coalesced probe and does not wait for it.
-3. Immediately runs the active generation when the saved result is current, or shows a Codex-style update screen when that result is pending.
-
-The new probe only resolves and records the desired source; it never builds or activates anything. Its result cannot affect the launch that started it: launch A may discover an update in the background, and launch B offers **Build patched update now** or **Exit**. Service and other noninteractive launches never open a TUI and follow the configured pending policy. A wrapped `codex update` runs `codex-patcher update`.
-
-The dispatcher preserves arguments, working directory, environment, stdio, signals, and exit status. It keeps protocol stdout clean and disables Codex's own startup update prompt.
-
-## Patch directory
-
-Place `codex-patcher.toml` beside your patches:
+Put `codex-patcher.toml` next to your patch files:
 
 ```toml
 schema = 1
@@ -38,28 +36,96 @@ failure_mode = "error"
 noninteractive_pending = "auto"
 ```
 
-`branch` is `stable`, `alpha` (published prereleases), or `nightly` (the current `main` commit). `target` is `official-native` or a supported same-host triple. `failure_mode` is `error` or `last-good`; `noninteractive_pending` is `auto`, `warn-run`, or `error`, with `auto` deriving from the failure mode. Unknown keys and unsupported values fail validation.
+`branch` can be `stable`, `alpha`, or `nightly`. `target` is
+`official-native` or a supported same-host target triple.
 
-If `series` exists, it is authoritative: use one UTF-8 relative patch path per line; blank lines and `#` comments are allowed. Otherwise all regular `*.patch` files are applied recursively in bytewise relative-path order. Absolute paths, traversal, symlinks, duplicates, case-folding collisions, missing files, and unlisted patches are rejected. Fingerprints cover ordered names and exact bytes, not mtimes.
+`failure_mode` controls what happens when a build fails:
 
-## Manage
+- `error` stops instead of running an older generation.
+- `last-good` keeps using the last validated generation when that is safe.
 
-The management commands are `scan`, `status`, `update [--retry] [--accept-retag] [--accept-force-push]`, `repair [FAILURE_ID]`, `repair-shims`, `uninstall`, and `gc`; run them as `codex-patcher <command>`.
+`noninteractive_pending` controls service and protocol launches when an update is
+waiting:
 
-Retags, release deletion or downgrade, and non-fast-forward `main` changes require the corresponding explicit acceptance flag. Deterministic failures stay cached until inputs change or `--retry` is supplied; a warm-generation network failure is reported as degraded, not as a confirmed update.
+- `auto` follows the failure mode.
+- `warn-run` prints a warning and runs the current generation.
+- `error` exits instead of starting Codex.
 
-## Recovery and takeover
+If a `series` file exists, it defines the patch order with one relative patch
+path per line. Blank lines and `#` comments are allowed. Without `series`, all
+regular `*.patch` files are applied recursively in bytewise path order.
 
-Discovery lists each launcher separately, including owner, precedence, resolved identity, and overwrite risk. Signed bundles and protected command surfaces remain visible but read-only. Recognized updaters are disabled only through reversible adapters; privileged takeover or restore elevates only that narrow operation.
+Codex Patcher rejects absolute paths, traversal, symlinks, duplicates,
+case-folding collisions, missing files, and unlisted patches.
 
-An installation owner may later overwrite a dispatcher. `status` detects drift; `repair-shims --adopt-drift --yes` can explicitly adopt the new artifact as the restore baseline and reapply the dispatcher. Repair and uninstall use compare-and-swap identity checks, so a drifted path is reported and left untouched rather than clobbered. `uninstall --yes` restores unchanged baselines and removes patcher state only when no build or generation lease is in use.
+## How Launches Work
 
-For patch failures, `repair [FAILURE_ID]` reconstructs the exact failed source and patch commits in a disposable worktree, launches the pinned last-good Codex with workspace-write access, regenerates the complete normalized patch stack, rebuilds it, and shows every patch-file change before asking for confirmation.
+There is no daemon or watcher. A wrapped `codex` launch does three small things:
 
-## Build and security model
+1. Reads the last saved update check.
+2. Starts one detached background probe if another probe is not already running.
+3. Immediately runs the active validated generation, or shows an update prompt
+   if a previous probe found new source.
 
-Codex Patcher keeps a private Git mirror, isolated worktrees, exact source identities, and strict `git apply --check` then `git apply --index` semantics—never fuzzy or three-way fallback. It uses Codex's [canonical package builder](https://github.com/openai/codex/tree/main/scripts/codex_package), validates package metadata, resources, CLI help/version, and app-server behavior, then rechecks live inputs before atomic activation.
+The probe never builds anything for the launch that started it. If launch A finds
+an update in the background, launch B is the first one that can offer to build
+it.
 
-Compiler output lives in a persistent `CARGO_TARGET_DIR`, partitioned only by compatible target, Cargo profile, and toolchain identity—not by commit, patch fingerprint, source key, generation, or staging path. Updates therefore reuse incremental artifacts. Build failure and `gc` never delete this cache; uninstall waits for any build before removing it.
+Interactive launches show a Codex-style prompt. Service, protocol, and other
+noninteractive launches follow `noninteractive_pending`. A wrapped
+`codex update` is routed to `codex-patcher update`.
 
-State, logs, backups, generations, mirror, and caches use platform per-user application-data locations. `CODEX_PATCHER_HOME` places all patcher-owned data under one explicit root. Patched generations stay outside Codex's official standalone tree. Builds run trusted upstream and patch code with the current user's privileges.
+Arguments, working directory, environment, stdio, signals, and exit status are
+preserved. Codex's own startup update prompt is disabled inside managed
+generations.
+
+## Commands
+
+Run management commands through the unwrapped `codex-patcher` binary:
+
+```sh
+codex-patcher scan
+codex-patcher status
+codex-patcher update [--retry] [--accept-retag] [--accept-force-push]
+codex-patcher repair [FAILURE_ID]
+codex-patcher repair-shims
+codex-patcher uninstall
+codex-patcher gc
+```
+
+Retags, deleted releases, downgrades, and non-fast-forward nightly movement need
+explicit acceptance flags. Deterministic failures are cached until inputs change
+or you pass `--retry`.
+
+## Recovery
+
+`scan` reports each launcher separately, including owner, precedence, resolved
+identity, and overwrite risk. Protected or signed launchers stay visible but are
+not modified.
+
+If another installer overwrites a managed launcher, `status` reports drift.
+`repair-shims --adopt-drift --yes` can adopt that new file as the restore
+baseline and then reapply the dispatcher. Repair and uninstall use
+compare-and-swap checks, so drifted paths are reported instead of overwritten.
+
+`repair [FAILURE_ID]` recreates the failed source and patch stack in a temporary
+worktree, launches the pinned last-good Codex for a repair pass, rebuilds the
+result, and shows every patch-file change before confirmation.
+
+`uninstall --yes` restores unchanged baselines and removes patcher state only
+when no build or generation lease is active.
+
+## State And Trust
+
+Codex Patcher keeps its mirror, worktrees, generations, logs, backups, and caches
+under per-user application-data directories. Set `CODEX_PATCHER_HOME` to place
+all patcher-owned state under one explicit root.
+
+Builds use the upstream package builder and run with the current user's
+privileges. Patch application is strict: `git apply --check` followed by
+`git apply --index`, with no fuzzy or three-way fallback.
+
+Compiler output is kept in a persistent `CARGO_TARGET_DIR` partitioned by
+compatible target, Cargo profile, and toolchain identity. Build failures and
+garbage collection do not delete that cache; uninstall waits for active builds
+before removing it.
