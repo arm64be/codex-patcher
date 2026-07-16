@@ -17,12 +17,12 @@ including x86-64 and ARM64 runners.
 ```sh
 cargo install --git https://github.com/arm64be/codex-patcher --locked
 codex-patcher quickstart
-codex-patcher scan
-codex-patcher install "${CODEX_HOME:-$HOME/.codex}/codex-patcher"
+codex-patcher install
 ```
 
 `install` builds and validates the patched Codex package before it changes a
-launcher. Keep the `codex-patcher` management binary somewhere outside the
+launcher. With no patch-directory argument, it uses the directory created by
+`quickstart`. Keep the `codex-patcher` management binary somewhere outside the
 launcher paths you select. If `CODEX_HOME` is unset, `quickstart` uses
 `~/.codex/codex-patcher`.
 
@@ -92,7 +92,8 @@ Run management commands through the unwrapped `codex-patcher` binary:
 
 ```sh
 codex-patcher quickstart [--force]
-codex-patcher scan
+codex-patcher install [PATCH_DIR] [--surface PATH] [--yes]
+codex-patcher scan [--verbose | --json]
 codex-patcher status
 codex-patcher update [--retry] [--accept-retag] [--accept-force-push]
 codex-patcher repair [FAILURE_ID]
@@ -107,9 +108,10 @@ or you pass `--retry`.
 
 ## Recovery
 
-`scan` reports each launcher separately, including owner, precedence, resolved
-identity, and overwrite risk. Protected or signed launchers stay visible but are
-not modified.
+`scan` shows a compact, deduplicated launcher summary. `scan --verbose` includes
+discovery origins, resolved filesystem identity, and overwrite risk;
+`scan --json` exposes the same diagnostic model for automation. Protected or
+signed launchers stay visible but are not modified.
 
 If another installer overwrites a managed launcher, `status` reports drift.
 `repair-shims --adopt-drift --yes` can adopt that new file as the restore

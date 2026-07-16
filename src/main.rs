@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use codex_patcher::config::Config;
-use codex_patcher::discovery::{Redirectability, SurfaceCandidate, SurfaceOwner, discover};
+use codex_patcher::discovery::{
+    Redirectability, SurfaceCandidate, SurfaceOwner, UpdateMethod, discover,
+};
 use codex_patcher::dispatch::{
     UpdateOptions, dispatch, foreground_update, foreground_update_locked,
     handle_interactive_failure,
@@ -20,7 +22,7 @@ use codex_patcher::state::{InstallState, StateStore};
 use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
 use directories::BaseDirs;
 use fs2::FileExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
@@ -46,7 +48,8 @@ enum ManagerCommand {
     },
     /// Build the first patched generation and take over selected Codex launchers.
     Install {
-        patch_dir: PathBuf,
+        /// Patch directory. Defaults to the directory created by quickstart.
+        patch_dir: Option<PathBuf>,
         /// Select exact surfaces without the interactive multi-select prompt.
         #[arg(long = "surface")]
         surfaces: Vec<PathBuf>,
@@ -55,8 +58,11 @@ enum ManagerCommand {
     },
     /// Discover concrete Codex launch surfaces without modifying them.
     Scan {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "verbose")]
         json: bool,
+        /// Include discovery origins, filesystem identity, and risk details.
+        #[arg(long, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Show active, desired, failure, and shim ownership state.
     Status {
@@ -121,8 +127,14 @@ fn real_main() -> Result<()> {
             patch_dir,
             surfaces,
             yes,
-        } => install(&paths, &patch_dir, &surfaces, yes),
-        ManagerCommand::Scan { json } => scan(&paths, json),
+        } => {
+            let patch_dir = match patch_dir {
+                Some(path) => path,
+                None => quickstart_patch_dir()?,
+            };
+            install(&paths, &patch_dir, &surfaces, yes)
+        }
+        ManagerCommand::Scan { json, verbose } => scan(&paths, json, verbose),
         ManagerCommand::Status { json } => status(&paths, json),
         ManagerCommand::Update {
             retry,
@@ -201,11 +213,8 @@ patch stack behaves consistently across Linux, macOS, and Windows.
 fn quickstart(force: bool) -> Result<()> {
     let patch_dir = quickstart_patch_dir()?;
     write_quickstart(&patch_dir, force)?;
-    println!(
-        "created quickstart patch directory: {}",
-        patch_dir.display()
-    );
-    println!("next: codex-patcher install {}", patch_dir.display());
+    println!("Starter patch created at {}", display_user_path(&patch_dir));
+    println!("Next: codex-patcher install");
     Ok(())
 }
 
@@ -312,7 +321,6 @@ fn install(
     PatchSet::load(&patch_dir)?;
 
     let candidates = discover(paths)?;
-    print_candidates(&candidates);
     let selected = select_surfaces(paths, &candidates, explicit_surfaces, yes)?;
     if selected.is_empty() {
         bail!("no redirectable Codex surfaces were selected");
@@ -320,9 +328,9 @@ fn install(
     for surface in &selected {
         validate_surface_launcher_type(surface)?;
     }
-    eprintln!("\nSelected takeover paths:");
+    eprintln!("\nCodex launchers to manage:");
     for surface in &selected {
-        eprintln!("  {}", surface.display());
+        eprintln!("  {}", display_user_path(surface));
     }
 
     let selected_candidates = selected_candidates(&candidates, &selected)?;
@@ -341,10 +349,9 @@ fn install(
             && warned_owner_paths.insert(candidate.raw.clone())
     }) {
         eprintln!(
-            "WARNING: {} is owned by {} ({}); that owner can overwrite the dispatcher, and recovery is manual via `codex-patcher repair-shims`",
-            candidate.raw.display(),
-            format!("{:?}", candidate.owner).to_lowercase(),
-            candidate.update_method.label()
+            "Warning: {} is maintained by {}; its updater can replace the dispatcher. Run `codex-patcher repair-shims` if that happens.",
+            display_user_path(&candidate.raw),
+            update_method_display(candidate.update_method)
         );
     }
     let updater_plan = if system_updater_owner_selected {
@@ -373,7 +380,7 @@ fn install(
     }
     if !yes
         && !Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Build Codex and replace these paths in place?")
+            .with_prompt("Build Codex and redirect these launchers?")
             .default(false)
             .interact()?
     {
@@ -474,22 +481,39 @@ fn install(
     }
     eprintln!(
         "codex-patcher installed; management binary: {}",
-        paths.manager.display()
+        display_user_path(&paths.manager)
     );
     Ok(())
 }
 
-fn scan(paths: &PatcherPaths, json: bool) -> Result<()> {
+fn scan(paths: &PatcherPaths, json: bool, verbose: bool) -> Result<()> {
     let candidates = discover(paths)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&candidates)?);
+    } else if verbose {
+        print_candidates_verbose(&candidates);
     } else {
-        print_candidates(&candidates);
+        print_candidate_summary(&candidates);
     }
     Ok(())
 }
 
-fn print_candidates(candidates: &[SurfaceCandidate]) {
+fn print_candidate_summary(candidates: &[SurfaceCandidate]) {
+    let choices = surface_choices(candidates.iter());
+    if choices.is_empty() {
+        println!("No Codex launchers found.");
+        return;
+    }
+
+    println!("Codex launchers:");
+    for choice in choices {
+        println!("  {}", display_user_path(&choice.candidate.raw));
+        println!("    {}", surface_choice_details(&choice));
+    }
+    println!("\nRun `codex-patcher scan --verbose` for diagnostic details.");
+}
+
+fn print_candidates_verbose(candidates: &[SurfaceCandidate]) {
     println!(
         "{:<4} {:<20} {:<12} {:<20} {:<12} {:<10} {:<10} path",
         "#", "precedence", "owner", "update", "redirect", "risk", "version"
@@ -504,14 +528,14 @@ fn print_candidates(candidates: &[SurfaceCandidate]) {
             format!("{:?}", candidate.redirectability).to_lowercase(),
             format!("{:?}", candidate.risk).to_lowercase(),
             candidate.version.as_deref().unwrap_or("unknown"),
-            candidate.raw.display()
+            display_user_path(&candidate.raw)
         );
         if candidate
             .resolved
             .as_deref()
             .is_some_and(|path| path != candidate.raw)
         {
-            println!("     -> {}", candidate.display_path().display());
+            println!("     -> {}", display_user_path(candidate.display_path()));
         }
         if let Some(identity) = candidate.file_identity.identity.as_ref() {
             let platform_identity = match (
@@ -532,8 +556,8 @@ fn print_candidates(candidates: &[SurfaceCandidate]) {
                     .file_identity
                     .path
                     .as_deref()
-                    .unwrap_or_else(|| candidate.display_path())
-                    .display(),
+                    .map(display_user_path)
+                    .unwrap_or_else(|| display_user_path(candidate.display_path())),
                 identity.length,
                 identity
                     .modified_ns
@@ -597,42 +621,98 @@ fn select_surfaces(
     if yes || !terminal_interactive() {
         bail!("noninteractive install requires at least one --surface PATH");
     }
-    let selectable: Vec<_> = candidates
+    let choices = surface_choices(candidates.iter().filter(|candidate| {
+        candidate.exists
+            && matches!(
+                candidate.redirectability,
+                Redirectability::Direct | Redirectability::OwnerManaged
+            )
+    }));
+    if choices.is_empty() {
+        bail!("no redirectable Codex launchers were found");
+    }
+    let labels: Vec<_> = choices
         .iter()
-        .filter(|candidate| {
-            candidate.exists
-                && matches!(
-                    candidate.redirectability,
-                    Redirectability::Direct | Redirectability::OwnerManaged
-                )
-        })
-        .collect();
-    let labels: Vec<_> = selectable
-        .iter()
-        .map(|candidate| {
+        .map(|choice| {
             format!(
-                "{}  owner={:?} version={} risk={:?}",
-                candidate.raw.display(),
-                candidate.owner,
-                candidate.version.as_deref().unwrap_or("unknown"),
-                candidate.risk
+                "{} — {}",
+                display_user_path(&choice.candidate.raw),
+                surface_choice_details(choice)
             )
         })
         .collect();
-    let defaults: Vec<_> = selectable
-        .iter()
-        .map(|candidate| candidate.current)
-        .collect();
+    let defaults: Vec<_> = choices.iter().map(|choice| choice.current).collect();
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select Codex command surfaces to redirect")
+        .with_prompt("Select Codex launchers to manage")
         .items(&labels)
         .defaults(&defaults)
         .interact()?;
     deduplicate_surface_paths(
         selected
             .into_iter()
-            .map(|index| selectable[index].raw.clone()),
+            .map(|index| choices[index].candidate.raw.clone()),
     )
+}
+
+struct SurfaceChoice<'a> {
+    candidate: &'a SurfaceCandidate,
+    current: bool,
+}
+
+fn surface_choices<'a>(
+    candidates: impl IntoIterator<Item = &'a SurfaceCandidate>,
+) -> Vec<SurfaceChoice<'a>> {
+    let mut positions: HashMap<PathBuf, usize> = HashMap::new();
+    let mut choices: Vec<SurfaceChoice<'a>> = Vec::new();
+    for candidate in candidates {
+        let key =
+            normalize_surface_path(&candidate.raw).unwrap_or_else(|_| candidate.raw.to_path_buf());
+        if let Some(index) = positions.get(&key).copied() {
+            let choice = &mut choices[index];
+            let prefer_candidate = (candidate.current && !choice.current)
+                || (choice.candidate.version.is_none() && candidate.version.is_some());
+            choice.current |= candidate.current;
+            if prefer_candidate {
+                choice.candidate = candidate;
+            }
+        } else {
+            positions.insert(key, choices.len());
+            choices.push(SurfaceChoice {
+                candidate,
+                current: candidate.current,
+            });
+        }
+    }
+    choices
+}
+
+fn surface_choice_details(choice: &SurfaceChoice<'_>) -> String {
+    let mut details = Vec::new();
+    if choice.current {
+        details.push("current".to_owned());
+    }
+    if let Some(version) = choice.candidate.version.as_deref() {
+        details.push(format!("Codex {version}"));
+    }
+    details.push(update_method_display(choice.candidate.update_method).to_owned());
+    if choice.candidate.redirectability == Redirectability::NotRedirectable {
+        details.push("not selectable".to_owned());
+    }
+    details.join(" · ")
+}
+
+fn update_method_display(method: UpdateMethod) -> &'static str {
+    match method {
+        UpdateMethod::CodexPatcher => "codex-patcher",
+        UpdateMethod::OfficialStandalone => "official standalone install",
+        UpdateMethod::NpmGlobal => "npm install",
+        UpdateMethod::PnpmGlobal => "pnpm install",
+        UpdateMethod::BunGlobal => "Bun install",
+        UpdateMethod::HomebrewCask => "Homebrew install",
+        UpdateMethod::DesktopUpdater => "Codex desktop app",
+        UpdateMethod::Manual => "manual install",
+        UpdateMethod::Unknown => "unknown source",
+    }
 }
 
 /// Normalize only the parent of a launcher path. Canonicalizing the complete
@@ -1285,6 +1365,55 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn display_user_path(path: &Path) -> String {
+    BaseDirs::new()
+        .map(|directories| display_user_path_with_home(path, directories.home_dir()))
+        .unwrap_or_else(|| plain_path_display(path))
+}
+
+fn display_user_path_with_home(path: &Path, home: &Path) -> String {
+    #[cfg(not(windows))]
+    if let Ok(relative) = path.strip_prefix(home) {
+        return if relative.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            Path::new("~").join(relative).display().to_string()
+        };
+    }
+
+    let rendered = plain_path_display(path);
+    #[cfg(windows)]
+    {
+        let home = plain_path_display(home);
+        let rendered_folded = rendered.to_ascii_lowercase();
+        let home_folded = home.to_ascii_lowercase();
+        if rendered_folded == home_folded {
+            return "~".to_owned();
+        }
+        let suffix = &rendered[home.len().min(rendered.len())..];
+        if rendered_folded.starts_with(&home_folded)
+            && (suffix.starts_with('\\') || suffix.starts_with('/'))
+        {
+            return format!("~{}", &rendered[home.len()..]);
+        }
+    }
+    rendered
+}
+
+fn plain_path_display(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+            return rest.to_owned();
+        }
+    }
+    rendered
+}
+
 fn terminal_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -1315,6 +1444,30 @@ mod tests {
         assert_eq!(selected[0].file_name(), Some(std::ffi::OsStr::new("codex")));
     }
 
+    #[test]
+    fn paths_under_home_are_compact_for_display() {
+        #[cfg(unix)]
+        let (home, child) = (
+            Path::new("/home/example"),
+            Path::new("/home/example/.codex/codex-patcher"),
+        );
+        #[cfg(windows)]
+        let (home, child) = (
+            Path::new(r"C:\Users\example"),
+            Path::new(r"\\?\C:\Users\example\.codex\codex-patcher"),
+        );
+
+        assert_eq!(display_user_path_with_home(home, home), "~");
+        assert_eq!(
+            display_user_path_with_home(child, home),
+            Path::new("~")
+                .join(".codex")
+                .join("codex-patcher")
+                .display()
+                .to_string()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn normalization_preserves_the_final_launcher_symlink() {
@@ -1328,10 +1481,12 @@ mod tests {
         fs::write(package.join("codex"), b"package executable").unwrap();
         symlink(package.join("codex"), bin.join("codex")).unwrap();
 
+        let normalized = normalize_surface_path(&bin.join("codex")).unwrap();
         assert_eq!(
-            normalize_surface_path(&bin.join("codex")).unwrap(),
-            bin.join("codex")
+            normalized.parent(),
+            Some(bin.canonicalize().unwrap().as_path())
         );
+        assert_eq!(normalized.file_name(), Some(std::ffi::OsStr::new("codex")));
     }
 
     #[test]

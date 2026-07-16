@@ -61,9 +61,17 @@ pub fn spawn_detached(paths: &PatcherPaths) -> Result<()> {
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
+    // std::process uses CreateProcessW with handle inheritance enabled when
+    // redirecting stdio. Without this guard, a detached probe can also inherit
+    // the dispatcher's unrelated stdout/stderr pipes and keep callers waiting
+    // for EOF until the probe exits.
+    #[cfg(windows)]
+    let standard_handles = WindowsStandardHandleInheritanceGuard::new()?;
     let child = command
         .spawn()
         .context("spawning detached freshness probe")?;
+    #[cfg(windows)]
+    drop(standard_handles);
     #[cfg(unix)]
     {
         let mut child = child;
@@ -74,6 +82,65 @@ pub fn spawn_detached(paths: &PatcherPaths) -> Result<()> {
     #[cfg(not(unix))]
     drop(child);
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsStandardHandleInheritanceGuard {
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl WindowsStandardHandleInheritanceGuard {
+    fn new() -> Result<Self> {
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        let mut guard = Self {
+            handles: Vec::new(),
+        };
+        for (name, kind) in [
+            ("stdin", STD_INPUT_HANDLE),
+            ("stdout", STD_OUTPUT_HANDLE),
+            ("stderr", STD_ERROR_HANDLE),
+        ] {
+            let handle = unsafe { GetStdHandle(kind) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE || guard.handles.contains(&handle)
+            {
+                continue;
+            }
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("inspect inherited {name} handle"));
+            }
+            if flags & HANDLE_FLAG_INHERIT == 0 {
+                continue;
+            }
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("suppress {name} inheritance for detached probe"));
+            }
+            guard.handles.push(handle);
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsStandardHandleInheritanceGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        for handle in self.handles.drain(..) {
+            unsafe {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
 }
 
 pub fn run_internal(paths: &PatcherPaths) -> Result<()> {
