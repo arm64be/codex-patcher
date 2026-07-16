@@ -4,6 +4,7 @@ use codex_patcher::paths::PATCHER_HOME_ENV;
 use common::DispatcherFixture;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -25,11 +26,37 @@ fn interactive_update_restores_a_native_pty_or_conpty() {
     let mut writer = pair.master.take_writer().unwrap();
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
+    let (prompt_ready, wait_for_prompt) = mpsc::channel();
     let output = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = reader.read_to_end(&mut bytes);
+        let mut buffer = [0_u8; 4096];
+        let mut prompt_reported = false;
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if !prompt_reported
+                && bytes
+                    .windows(b"Update available!".len())
+                    .any(|window| window == b"Update available!")
+            {
+                let _ = prompt_ready.send(());
+                prompt_reported = true;
+            }
+        }
         bytes
     });
+    if wait_for_prompt
+        .recv_timeout(Duration::from_secs(10))
+        .is_err()
+    {
+        let _ = child.kill();
+        drop(writer);
+        drop(pair.master);
+        let output = String::from_utf8_lossy(&output.join().unwrap()).into_owned();
+        panic!("interactive update prompt was not ready: {output:?}");
+    }
     writer.write_all(b"2").unwrap();
     writer.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

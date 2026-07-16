@@ -24,6 +24,8 @@ const MAX_PACKAGE_EXECUTABLES: usize = 32;
 const MAX_PACKAGE_SCAN_ENTRIES: usize = 4_096;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
+const VERSION_PROBE_BUSY_RETRIES: usize = 4;
+#[cfg(unix)]
 const MAX_SHELL_RESOLUTIONS: usize = 16;
 #[cfg(any(windows, test))]
 const MAX_POWERSHELL_RESOLUTIONS: usize = 64;
@@ -1271,12 +1273,14 @@ pub fn probe_version(path: &Path, timeout: Duration) -> Result<Option<String>> {
 pub fn probe_version_detailed(path: &Path, timeout: Duration) -> VersionProbe {
     let started = Instant::now();
     let mut command = version_command(path);
-    let child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("CODEX_PATCHER_DISCOVERY", "1")
-        .spawn();
+        .env("CODEX_PATCHER_DISCOVERY", "1");
+    #[cfg(unix)]
+    isolate_command_session(&mut command);
+    let child = spawn_version_command(&mut command);
     let mut child = match child {
         Ok(child) => child,
         Err(error) => return failed_probe(started, ProbeStatus::Failed, error.to_string()),
@@ -1285,8 +1289,7 @@ pub fn probe_version_detailed(path: &Path, timeout: Duration) -> VersionProbe {
     let status = match child.wait_timeout(timeout) {
         Ok(Some(status)) => status,
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_bounded_child(&mut child, cfg!(unix));
             return failed_probe(
                 started,
                 ProbeStatus::TimedOut,
@@ -1294,8 +1297,7 @@ pub fn probe_version_detailed(path: &Path, timeout: Duration) -> VersionProbe {
             );
         }
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_bounded_child(&mut child, cfg!(unix));
             return failed_probe(started, ProbeStatus::Failed, error.to_string());
         }
     };
@@ -1331,6 +1333,47 @@ pub fn probe_version_detailed(path: &Path, timeout: Duration) -> VersionProbe {
             .is_none()
             .then_some("unrecognized version output".to_string()),
         elapsed_ms: started.elapsed().as_millis(),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_version_command(command: &mut Command) -> std::io::Result<std::process::Child> {
+    for retry in 0..=VERSION_PROBE_BUSY_RETRIES {
+        match command.spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && retry < VERSION_PROBE_BUSY_RETRIES =>
+            {
+                // A concurrent fork can briefly inherit the writer for a
+                // freshly replaced launcher until that child reaches exec.
+                // Linux reports ETXTBSY during that window.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded retry loop always returns")
+}
+
+#[cfg(not(unix))]
+fn spawn_version_command(command: &mut Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
+}
+
+#[cfg(unix)]
+fn isolate_command_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // A version launcher may delegate to another process. Isolating it lets a
+    // timed-out probe terminate that whole process group instead of leaking a
+    // child that keeps the launcher or output pipes open.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -1511,14 +1554,34 @@ mod tests {
         let probe = probe_version_detailed(&codex, Duration::from_secs(1));
         assert_eq!(
             (probe.status, probe.version.as_deref()),
-            (ProbeStatus::Succeeded, Some("1.2.3"))
+            (ProbeStatus::Succeeded, Some("1.2.3")),
+            "{probe:#?}"
         );
         assert_eq!(parse_codex_version("noise"), None);
 
         executable(&codex, "#!/bin/sh\nsleep 5\n");
+        let probe = probe_version_detailed(&codex, Duration::from_millis(30));
+        assert_eq!(probe.status, ProbeStatus::TimedOut, "{probe:#?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_probe_retries_a_transient_busy_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex = temp.path().join("codex");
+        executable(&codex, "#!/bin/sh\nprintf 'codex-cli 1.2.3\\n'\n");
+        let writer = fs::OpenOptions::new().write(true).open(&codex).unwrap();
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(writer);
+        });
+
+        let probe = probe_version_detailed(&codex, Duration::from_secs(1));
+        release_writer.join().unwrap();
         assert_eq!(
-            probe_version_detailed(&codex, Duration::from_millis(30)).status,
-            ProbeStatus::TimedOut
+            (probe.status, probe.version.as_deref()),
+            (ProbeStatus::Succeeded, Some("1.2.3")),
+            "{probe:#?}"
         );
     }
 
