@@ -15,16 +15,25 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Stderr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 const SNAPSHOT_WIDTH: usize = 80;
 const SNAPSHOT_HEIGHT: usize = 12;
+const MAX_PROGRESS_LOG_LINES: usize = 16;
+const PROGRESS_BOTTOM_MARGIN: usize = 3;
+const PROGRESS_HEADER_LINES: usize = 6;
+const PROGRESS_HISTORY_LIMIT: usize = 64;
+const PROGRESS_TICK: Duration = Duration::from_secs(1);
+const PROGRESS_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static SIGNAL_RESTORER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
@@ -123,8 +132,11 @@ pub struct ProgressScreen {
     pub current_version: String,
     pub desired_version: String,
     pub phase: String,
-    pub latest_line: Option<String>,
+    pub recent_lines: VecDeque<String>,
     pub log_path: Option<PathBuf>,
+    pub elapsed_seconds: u64,
+    pub quiet_seconds: u64,
+    pub animation_frame: usize,
 }
 
 impl ProgressScreen {
@@ -133,8 +145,11 @@ impl ProgressScreen {
             current_version: current_version.into(),
             desired_version: desired_version.into(),
             phase: "Resolve upstream".to_owned(),
-            latest_line: None,
+            recent_lines: VecDeque::new(),
             log_path: None,
+            elapsed_seconds: 0,
+            quiet_seconds: 0,
+            animation_frame: 0,
         }
     }
 }
@@ -148,7 +163,7 @@ pub fn render_failure_80x12(screen: &FailureScreen, options: RenderOptions) -> S
 }
 
 pub fn render_progress_80x12(screen: &ProgressScreen, options: RenderOptions) -> String {
-    render_snapshot(progress_styled_lines(screen, options))
+    render_snapshot(progress_styled_lines(screen, SNAPSHOT_HEIGHT, options))
 }
 
 pub fn prompt_update(screen: &UpdateScreen) -> Result<UpdateChoice> {
@@ -231,15 +246,37 @@ impl ProgressHandle {
     }
 
     pub fn set_phase(&self, phase: impl Into<String>) -> Result<()> {
-        self.mutate(|screen| screen.phase = sanitize_line(&phase.into()))
+        self.mutate(|screen| {
+            screen.phase = sanitize_line(&phase.into());
+            screen.quiet_seconds = 0;
+        })
     }
 
     pub fn set_latest_line(&self, line: impl Into<String>) -> Result<()> {
-        self.mutate(|screen| screen.latest_line = Some(sanitize_line(&line.into())))
+        self.mutate(|screen| {
+            if screen.recent_lines.len() == PROGRESS_HISTORY_LIMIT {
+                screen.recent_lines.pop_front();
+            }
+            screen
+                .recent_lines
+                .push_back(compact_progress_line(&sanitize_line(&line.into())));
+            screen.quiet_seconds = 0;
+        })
     }
 
     pub fn clear_latest_line(&self) -> Result<()> {
-        self.mutate(|screen| screen.latest_line = None)
+        self.mutate(|screen| {
+            screen.recent_lines.clear();
+            screen.quiet_seconds = 0;
+        })
+    }
+
+    fn tick(&self) -> Result<()> {
+        self.mutate(|screen| {
+            screen.elapsed_seconds = screen.elapsed_seconds.saturating_add(1);
+            screen.quiet_seconds = screen.quiet_seconds.saturating_add(1);
+            screen.animation_frame = screen.animation_frame.wrapping_add(1);
+        })
     }
 
     pub fn snapshot(&self) -> ProgressScreen {
@@ -276,6 +313,8 @@ impl ProgressHandle {
 /// Owns terminal restoration for a foreground build display.
 pub struct ProgressDisplay {
     shared: Arc<ProgressShared>,
+    ticker_stop: Option<mpsc::Sender<()>>,
+    ticker: Option<JoinHandle<()>>,
 }
 
 impl ProgressDisplay {
@@ -297,9 +336,28 @@ impl ProgressDisplay {
             terminal: Mutex::new(Some(terminal)),
             options,
         });
+        let (ticker_stop, ticker_wait) = mpsc::channel();
+        let ticker_handle = ProgressHandle {
+            shared: Arc::clone(&shared),
+        };
+        let ticker = std::thread::Builder::new()
+            .name("codex-patcher-progress".to_owned())
+            .spawn(move || {
+                while matches!(
+                    ticker_wait.recv_timeout(PROGRESS_TICK),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if ticker_handle.tick().is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("starting build progress refresh")?;
         Ok((
             Self {
                 shared: Arc::clone(&shared),
+                ticker_stop: Some(ticker_stop),
+                ticker: Some(ticker),
             },
             ProgressHandle { shared },
         ))
@@ -308,6 +366,12 @@ impl ProgressDisplay {
 
 impl Drop for ProgressDisplay {
     fn drop(&mut self) {
+        if let Some(stop) = self.ticker_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(ticker) = self.ticker.take() {
+            let _ = ticker.join();
+        }
         if let Ok(mut terminal) = self.shared.terminal.lock() {
             // Restore immediately even if cloned handles outlive this owner.
             let _ = terminal.take();
@@ -383,10 +447,15 @@ impl TerminalSession {
     }
 
     fn draw_progress(&mut self, screen: &ProgressScreen, options: RenderOptions) -> Result<()> {
-        self.draw_lines(
-            progress_styled_lines(screen, options),
-            "drawing build progress",
-        )
+        self.terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let lines = progress_styled_lines(screen, usize::from(area.height), options);
+                frame.render_widget(Clear, area);
+                frame.render_widget(Paragraph::new(lines), area);
+            })
+            .context("drawing build progress")?;
+        Ok(())
     }
 
     fn draw_lines(&mut self, lines: Vec<Line<'static>>, context: &'static str) -> Result<()> {
@@ -604,13 +673,17 @@ fn failure_styled_lines(
     lines
 }
 
-fn progress_styled_lines(screen: &ProgressScreen, options: RenderOptions) -> Vec<Line<'static>> {
-    let cyan = selected_style(options);
+fn progress_styled_lines(
+    screen: &ProgressScreen,
+    height: usize,
+    options: RenderOptions,
+) -> Vec<Line<'static>> {
+    let green = cargo_style(options, Color::Green);
     let icon = update_icon(options);
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("  {icon} "), cyan.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {icon} "), green.add_modifier(Modifier::BOLD)),
             Span::styled(
                 "Building patched Codex",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -624,23 +697,185 @@ fn progress_styled_lines(screen: &ProgressScreen, options: RenderOptions) -> Vec
         Line::from(""),
         Line::from(vec![
             Span::styled("  Phase  ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(sanitize_line(&screen.phase), cyan),
-        ]),
-    ];
-    if let Some(line) = &screen.latest_line {
-        lines.push(Line::from(format!("  {}", sanitize_line(line))));
-    }
-    if let Some(path) = &screen.log_path {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  Log: ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled(
-                path.display().to_string(),
-                Style::default().add_modifier(Modifier::DIM),
+                sanitize_line(&screen.phase),
+                green.add_modifier(Modifier::BOLD),
             ),
-        ]));
+        ]),
+        progress_activity_line(screen, options),
+        Line::from(""),
+    ];
+    let capacity = progress_log_capacity(height);
+    if capacity > 0 {
+        if screen.recent_lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  Waiting for build output…",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else {
+            lines.extend(
+                screen
+                    .recent_lines
+                    .iter()
+                    .skip(screen.recent_lines.len().saturating_sub(capacity))
+                    .map(|line| progress_log_line(line, options)),
+            );
+        }
     }
     lines
+}
+
+fn progress_activity_line(screen: &ProgressScreen, options: RenderOptions) -> Line<'static> {
+    let spinner = if options.ascii {
+        ["|", "/", "-", "\\"][screen.animation_frame % 4]
+    } else {
+        PROGRESS_SPINNER[screen.animation_frame % PROGRESS_SPINNER.len()]
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("  {spinner} "),
+            cargo_style(options, Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Still working",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {} elapsed", concise_duration(screen.elapsed_seconds)),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ];
+    if !screen.recent_lines.is_empty() && screen.quiet_seconds >= 2 {
+        spans.push(Span::styled(
+            format!(
+                " · last output {} ago",
+                concise_duration(screen.quiet_seconds)
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn progress_log_capacity(height: usize) -> usize {
+    height
+        .saturating_sub(PROGRESS_HEADER_LINES + PROGRESS_BOTTOM_MARGIN)
+        .min(MAX_PROGRESS_LOG_LINES)
+}
+
+fn progress_log_line(value: &str, options: RenderOptions) -> Line<'static> {
+    let value = sanitize_line(value);
+    let trimmed = value.trim_start();
+    for (prefix, color) in [
+        ("Compiling", Color::Green),
+        ("Checking", Color::Green),
+        ("Finished", Color::Green),
+        ("Running", Color::Green),
+        ("Updating", Color::Green),
+        ("Downloading", Color::Green),
+        ("Downloaded", Color::Green),
+        ("Locking", Color::Green),
+        ("Adding", Color::Green),
+        ("Removing", Color::Red),
+        ("Downgrading", Color::Yellow),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return Line::from(vec![
+                Span::styled(
+                    format!("  {prefix:>11}"),
+                    cargo_style(options, color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(rest.to_owned()),
+            ]);
+        }
+    }
+
+    if let Some(separator) = trimmed.find(':') {
+        let label = &trimmed[..=separator];
+        let color = if label.starts_with("warning") {
+            Some(Color::Yellow)
+        } else if label.starts_with("error") {
+            Some(Color::Red)
+        } else if matches!(label, "help:" | "note:") {
+            Some(Color::Cyan)
+        } else {
+            None
+        };
+        if let Some(color) = color {
+            return Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    label.to_owned(),
+                    cargo_style(options, color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(trimmed[separator + 1..].to_owned()),
+            ]);
+        }
+    }
+
+    if trimmed.starts_with("-->") {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled(trimmed.to_owned(), cargo_style(options, Color::Cyan)),
+        ]);
+    }
+    if let Some(gutter) = value.find('|') {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                value[..=gutter].to_owned(),
+                cargo_style(options, Color::Cyan),
+            ),
+            Span::raw(value[gutter + 1..].to_owned()),
+        ]);
+    }
+    Line::from(format!("  {value}"))
+}
+
+fn cargo_style(options: RenderOptions, color: Color) -> Style {
+    if options.color {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    }
+}
+
+fn concise_duration(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn compact_progress_line(value: &str) -> String {
+    let trimmed = value.trim_start();
+    let cargo_status = [
+        "Compiling",
+        "Checking",
+        "Finished",
+        "Running",
+        "Updating",
+        "Downloading",
+        "Downloaded",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix));
+    if cargo_status
+        && trimmed.ends_with(')')
+        && let Some(separator) = trimmed.rfind(" (")
+        && Path::new(&trimmed[separator + 2..trimmed.len() - 1]).is_absolute()
+    {
+        return trimmed[..separator].to_owned();
+    }
+    value.to_owned()
 }
 
 fn selection_line(
@@ -834,11 +1069,59 @@ mod tests {
         let handle = ProgressHandle::detached(ProgressScreen::new("0.1", "0.2"));
         handle.set_phase("Apply\npatches").unwrap();
         handle.set_latest_line("patch 1\rfailed").unwrap();
+        handle.tick().unwrap();
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.phase, "Apply patches");
-        assert_eq!(snapshot.latest_line.as_deref(), Some("patch 1 failed"));
+        assert_eq!(
+            snapshot.recent_lines.back().map(String::as_str),
+            Some("patch 1 failed")
+        );
+        assert_eq!(snapshot.elapsed_seconds, 1);
+        assert_eq!(snapshot.quiet_seconds, 1);
         let rendered = render_progress_80x12(&snapshot, RenderOptions::plain_ascii());
         assert!(rendered.contains("Phase  Apply patches"));
+        assert!(rendered.contains("Still working · 1s elapsed"));
+    }
+
+    #[test]
+    fn progress_view_keeps_a_bounded_tail_above_the_bottom_margin() {
+        assert_eq!(progress_log_capacity(8), 0);
+        assert_eq!(progress_log_capacity(12), 3);
+        assert_eq!(progress_log_capacity(25), 16);
+        assert_eq!(progress_log_capacity(80), 16);
+
+        let handle = ProgressHandle::detached(ProgressScreen::new("0.1", "0.2"));
+        for index in 0..PROGRESS_HISTORY_LIMIT + 2 {
+            handle.set_latest_line(format!("line {index}")).unwrap();
+        }
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.recent_lines.len(), PROGRESS_HISTORY_LIMIT);
+        assert_eq!(snapshot.recent_lines.front().unwrap(), "line 2");
+        let rendered = render_progress_80x12(&snapshot, RenderOptions::plain_ascii());
+        assert!(!rendered.contains("line 62"));
+        assert!(rendered.contains("line 63"));
+        assert!(rendered.contains("line 64"));
+        assert!(rendered.contains("line 65"));
+    }
+
+    #[test]
+    fn progress_lines_use_cargo_colors_and_hide_ephemeral_checkout_paths() {
+        let options = RenderOptions {
+            color: true,
+            ascii: true,
+        };
+        let compiling = progress_log_line("   Compiling rcgen v0.14.7", options);
+        assert_eq!(compiling.spans[0].style.fg, Some(Color::Green));
+        let warning = progress_log_line("warning: generated one warning", options);
+        assert_eq!(warning.spans[1].style.fg, Some(Color::Yellow));
+        let error = progress_log_line("error[E0463]: missing core", options);
+        assert_eq!(error.spans[1].style.fg, Some(Color::Red));
+
+        #[cfg(unix)]
+        assert_eq!(
+            compact_progress_line("   Compiling codex-core v0.144.5 (/tmp/worktree/codex-rs/core)"),
+            "Compiling codex-core v0.144.5"
+        );
     }
 
     #[test]
