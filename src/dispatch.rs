@@ -26,6 +26,7 @@ pub const MANAGED_UPDATE_OVERRIDE: &str = "check_for_update_on_startup=false";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UpdateOptions {
     pub retry: bool,
+    pub force_rebuild: bool,
     pub accept_retag: bool,
     pub accept_force_push: bool,
     pub interactive: bool,
@@ -611,6 +612,7 @@ fn foreground_update_locked_with_desired(
         &BuildOptions {
             allow_force_push: options.accept_force_push,
             retry: options.retry,
+            force_rebuild: options.force_rebuild,
         },
         &mut progress,
     );
@@ -739,7 +741,7 @@ fn record_transient_build_problem(
             },
             desired,
             Some(&format!(
-                "temporary network failure during {}: {} (log: {})",
+                "temporary build problem during {}: {} (log: {})",
                 failure.phase,
                 failure.summary,
                 failure.log_path.display()
@@ -1080,6 +1082,7 @@ mod tests {
             .unwrap(),
             Some(WrappedUpdate::Run(UpdateOptions {
                 retry: true,
+                force_rebuild: false,
                 accept_retag: false,
                 accept_force_push: true,
                 interactive: false,

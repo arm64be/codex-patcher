@@ -76,6 +76,13 @@ enum ManagerCommand {
         #[arg(long)]
         accept_force_push: bool,
     },
+    /// Rebuild and replace the current desired generation even if it already validates.
+    ForceRebuild {
+        #[arg(long)]
+        accept_retag: bool,
+        #[arg(long)]
+        accept_force_push: bool,
+    },
     /// Reapply externally overwritten dispatcher surfaces.
     RepairShims {
         #[arg(long)]
@@ -135,6 +142,20 @@ fn real_main() -> Result<()> {
             &paths,
             UpdateOptions {
                 retry,
+                force_rebuild: false,
+                accept_retag,
+                accept_force_push,
+                interactive: terminal_interactive(),
+            },
+        ),
+        ManagerCommand::ForceRebuild {
+            accept_retag,
+            accept_force_push,
+        } => update(
+            &paths,
+            UpdateOptions {
+                retry: true,
+                force_rebuild: true,
                 accept_retag,
                 accept_force_push,
                 interactive: terminal_interactive(),
@@ -193,6 +214,8 @@ Use this workflow:
 1. Edit or add patch files here.
 2. Start managed `codex`; by default it rebuilds immediately when only patches
    changed. Run `codex-patcher update --retry` to force a retry after failure.
+   Run `codex-patcher force-rebuild` to rebuild even when the current generation
+   already validates.
 3. Run `/status` in Codex and check the `Codex Patcher` line when using the
    starter patch.
 
@@ -1332,6 +1355,24 @@ fn terminal_interactive() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn force_rebuild_subcommand_is_exposed_and_parsed() {
+        let help = ManagerCli::command().render_long_help().to_string();
+        assert!(help.contains("force-rebuild"));
+
+        let parsed =
+            ManagerCli::try_parse_from(["codex-patcher", "force-rebuild", "--accept-force-push"])
+                .unwrap();
+        match parsed.command {
+            ManagerCommand::ForceRebuild {
+                accept_retag: false,
+                accept_force_push: true,
+            } => {}
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
 
     #[test]
     fn selected_surface_paths_are_lexically_normalized_and_deduplicated() {

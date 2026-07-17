@@ -114,6 +114,7 @@ codex-patcher install [PATCH_DIR] [--surface PATH] [--yes]
 codex-patcher scan [--verbose | --json]
 codex-patcher status
 codex-patcher update [--retry] [--accept-retag] [--accept-force-push]
+codex-patcher force-rebuild [--accept-retag] [--accept-force-push]
 codex-patcher repair-shims
 codex-patcher uninstall
 codex-patcher gc
@@ -121,7 +122,9 @@ codex-patcher gc
 
 Retags, deleted releases, downgrades, and non-fast-forward nightly movement need
 explicit acceptance flags. Deterministic failures are cached until inputs change
-or you pass `--retry`.
+or you pass `--retry`. `force-rebuild` bypasses both the failure cache and the
+validated-generation reuse path, then replaces the existing generation only
+after the rebuild validates.
 
 ## Recovery
 

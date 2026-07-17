@@ -427,11 +427,27 @@ fn copy_executable(source: &Path, destination: &Path) {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).expect("create executable parent");
     }
-    fs::copy(source, destination).unwrap_or_else(|error| {
+    let temporary = destination.with_file_name(format!(
+        ".{}.{}.copy",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("executable"),
+        uuid::Uuid::new_v4()
+    ));
+    fs::copy(source, &temporary).unwrap_or_else(|error| {
         panic!(
             "copy executable {} to {}: {error}",
             source.display(),
-            destination.display()
+            temporary.display()
         )
     });
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        panic!(
+            "rename executable {} to {}: {error}",
+            temporary.display(),
+            destination.display()
+        );
+    }
 }

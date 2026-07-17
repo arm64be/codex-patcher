@@ -5,6 +5,7 @@ use crate::types::{DesiredBuild, FileHash, GenerationManifest, GenerationRef};
 use crate::{STATE_SCHEMA, UPSTREAM_REPOSITORY};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use fs2::FileExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -35,7 +36,7 @@ pub enum BuildEvent {
 pub struct BuildFailure {
     pub phase: String,
     pub summary: String,
-    /// True only for recognized network/transport failures. These must not be
+    /// True for recognized non-deterministic conditions. These must not be
     /// cached as deterministic failures of a source key when last-good exists.
     pub transient: bool,
     pub failed_patch_index: Option<usize>,
@@ -62,7 +63,7 @@ impl BuildFailure {
         let phase = phase.into();
         let summary = sanitize_line(&error.to_string());
         Self {
-            transient: transient_network_failure(&phase, &summary, log_path),
+            transient: transient_build_failure(&phase, &summary, log_path),
             phase,
             summary,
             failed_patch_index: None,
@@ -78,7 +79,10 @@ impl BuildFailure {
     }
 }
 
-fn transient_network_failure(phase: &str, summary: &str, log_path: &Path) -> bool {
+fn transient_build_failure(phase: &str, summary: &str, log_path: &Path) -> bool {
+    if phase == "activate" && summary.contains("is currently running") {
+        return true;
+    }
     if !matches!(phase, "resolve" | "build") {
         return false;
     }
@@ -137,6 +141,7 @@ fn package_builder_log_diagnostic(target: &str, log_path: &Path) -> Option<Strin
 pub struct BuildOptions {
     pub allow_force_push: bool,
     pub retry: bool,
+    pub force_rebuild: bool,
 }
 
 pub fn build_generation(
@@ -184,6 +189,19 @@ struct BuildAttemptContext<'a> {
     failure_phase: &'a mut &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingGeneration {
+    None,
+    Corrupt,
+    ValidatedForceRebuild,
+}
+
+impl ExistingGeneration {
+    fn replaces_existing(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 fn build_generation_inner(
     paths: &PatcherPaths,
     patches: &PatchSet,
@@ -208,29 +226,40 @@ fn build_generation_inner(
 
     let final_root = paths.generations_dir().join(&desired.source_key);
     let final_manifest = final_root.join("generation.json");
-    let replacing_corrupt = if final_root.exists() {
+    let existing_generation = if final_root.exists() {
         *context.failure_phase = "validate";
         match load_validated_generation(&final_manifest, desired, &mut log) {
-            Ok(manifest) => {
+            Ok(manifest) if !options.force_rebuild => {
                 progress(BuildEvent::Line(
                     "using previously validated immutable generation".into(),
                 ));
                 return Ok(manifest.generation);
             }
-            Err(error) if options.retry => {
+            Ok(_) => {
                 writeln!(
                     log,
-                    "retry requested after immutable generation validation failed: {error:#}"
+                    "force rebuild requested; existing validated generation will be replaced after the replacement validates"
+                )?;
+                progress(BuildEvent::Line(
+                    "force rebuild requested; replacing existing generation after validation"
+                        .into(),
+                ));
+                ExistingGeneration::ValidatedForceRebuild
+            }
+            Err(error) if options.retry || options.force_rebuild => {
+                writeln!(
+                    log,
+                    "replacement requested after immutable generation validation failed: {error:#}"
                 )?;
                 progress(BuildEvent::Line(
                     "quarantining corrupt generation after replacement validates".into(),
                 ));
-                true
+                ExistingGeneration::Corrupt
             }
             Err(error) => return Err(error),
         }
     } else {
-        false
+        ExistingGeneration::None
     };
 
     *context.failure_phase = "resolve";
@@ -407,34 +436,51 @@ fn build_generation_inner(
     )?;
 
     *context.failure_phase = "activate";
-    if final_root.exists() && !replacing_corrupt {
+    if final_root.exists() && !existing_generation.replaces_existing() {
         bail!(
             "immutable generation destination appeared during build: {}",
             final_root.display()
         );
     }
-    let quarantine = paths
-        .generations_dir()
-        .join(format!(".corrupt-{}", Uuid::new_v4()));
-    if replacing_corrupt {
-        fs::rename(&final_root, &quarantine).with_context(|| {
+    let _replacement_lease = if existing_generation.replaces_existing() {
+        Some(acquire_generation_replacement_lease(
+            paths,
+            &desired.source_key,
+        )?)
+    } else {
+        None
+    };
+    let quarantine = existing_generation.replaces_existing().then(|| {
+        let prefix = match existing_generation {
+            ExistingGeneration::None => unreachable!(),
+            ExistingGeneration::Corrupt => ".corrupt",
+            ExistingGeneration::ValidatedForceRebuild => ".replaced",
+        };
+        paths
+            .generations_dir()
+            .join(format!("{prefix}-{}", Uuid::new_v4()))
+    });
+    if let Some(quarantine) = quarantine.as_ref() {
+        fs::rename(&final_root, quarantine).with_context(|| {
             format!(
-                "quarantining corrupt immutable generation {}",
+                "quarantining existing immutable generation {}",
                 final_root.display()
             )
         })?;
     }
     if let Err(error) = fs::rename(&staging_root, &final_root) {
-        if replacing_corrupt {
-            let _ = fs::rename(&quarantine, &final_root);
+        if let Some(quarantine) = quarantine.as_ref() {
+            let _ = fs::rename(quarantine, &final_root);
         }
         return Err(error).context("activating validated immutable generation");
     }
     let _ = File::open(paths.generations_dir()).and_then(|file| file.sync_all());
-    if replacing_corrupt && let Err(error) = fs::remove_dir_all(&quarantine) {
+    if let Some(quarantine) = quarantine.as_ref()
+        && let Err(error) = fs::remove_dir_all(quarantine)
+    {
         writeln!(
             log,
-            "warning: retained quarantined corrupt generation {}: {error}",
+            "warning: retained quarantined generation {}: {error}",
             quarantine.display()
         )?;
     }
@@ -496,6 +542,40 @@ pub(crate) fn load_validated_generation(
         );
     }
     Ok(manifest)
+}
+
+fn acquire_generation_replacement_lease(paths: &PatcherPaths, generation_id: &str) -> Result<File> {
+    if generation_id.is_empty()
+        || !generation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("generation id contains unsafe path characters");
+    }
+    let leases = paths.state_dir.join("leases");
+    fs::create_dir_all(&leases)?;
+    let lease_path = leases.join(format!("{generation_id}.lock"));
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lease_path)
+        .with_context(|| format!("opening generation lease {}", lease_path.display()))?;
+    match lease.try_lock_exclusive() {
+        Ok(()) => Ok(lease),
+        Err(error) if lock_is_contended(&error) => {
+            bail!("generation {generation_id} is currently running; stop it before force-rebuild")
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("locking generation {}", lease_path.display()))
+        }
+    }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    error.kind() == contended.kind() || error.raw_os_error() == contended.raw_os_error()
 }
 
 fn ensure_mirror(paths: &PatcherPaths, log: &mut File) -> Result<()> {
@@ -1155,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn only_network_build_failures_are_marked_transient() {
+    fn only_retryable_build_failures_are_marked_transient() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(
             temp.path(),
@@ -1164,9 +1244,42 @@ mod tests {
         .unwrap();
         assert!(BuildFailure::new("build", "builder failed", temp.path()).transient);
         assert!(!BuildFailure::new("patch", "builder failed", temp.path()).transient);
+        assert!(
+            BuildFailure::new(
+                "activate",
+                "generation abc is currently running; stop it before force-rebuild",
+                temp.path()
+            )
+            .transient
+        );
 
         fs::write(temp.path(), b"error[E0308]: mismatched types\n").unwrap();
         assert!(!BuildFailure::new("build", "builder failed", temp.path()).transient);
+    }
+
+    #[test]
+    fn generation_replacement_lease_refuses_running_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = PatcherPaths::from_home(temp.path());
+        paths.ensure().unwrap();
+        let id = "a".repeat(64);
+        let leases = paths.state_dir.join("leases");
+        fs::create_dir_all(&leases).unwrap();
+        let running = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(leases.join(format!("{id}.lock")))
+            .unwrap();
+        running.lock_shared().unwrap();
+
+        let error = acquire_generation_replacement_lease(&paths, &id).unwrap_err();
+        assert!(error.to_string().contains("currently running"));
+
+        running.unlock().unwrap();
+        let replacement = acquire_generation_replacement_lease(&paths, &id).unwrap();
+        replacement.unlock().unwrap();
     }
 
     #[test]
