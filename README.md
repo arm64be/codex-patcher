@@ -114,7 +114,6 @@ codex-patcher install [PATCH_DIR] [--surface PATH] [--yes]
 codex-patcher scan [--verbose | --json]
 codex-patcher status
 codex-patcher update [--retry] [--accept-retag] [--accept-force-push]
-codex-patcher repair [FAILURE_ID]
 codex-patcher repair-shims
 codex-patcher uninstall
 codex-patcher gc
@@ -133,17 +132,8 @@ signed launchers stay visible but are not modified.
 
 If another installer overwrites a managed launcher, `status` reports drift.
 `repair-shims --adopt-drift --yes` can adopt that new file as the restore
-baseline and then reapply the dispatcher. Repair and uninstall use
+baseline and then reapply the dispatcher. Shim repair and uninstall use
 compare-and-swap checks, so drifted paths are reported instead of overwritten.
-
-`repair [FAILURE_ID]` recreates the failed source and patch stack in a temporary
-worktree, launches the pinned last-good Codex for a repair pass, rebuilds the
-result, and shows every patch-file change before confirmation. The generated
-repair instructions are passed directly as that Codex process's initial
-positional prompt; terminal input is not synthesized and stdio remains attached.
-Repairs started by a managed Codex launch explicitly using `--yolo` or
-`--dangerously-bypass-approvals-and-sandbox` inherit that mode. All other repair
-sessions use a `workspace-write` sandbox with approval on request.
 
 `uninstall --yes` restores unchanged baselines and removes patcher state only
 when no build or generation lease is active.

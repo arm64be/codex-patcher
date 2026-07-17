@@ -6,7 +6,6 @@ pub mod elevation;
 pub mod patchset;
 pub mod paths;
 pub mod probe;
-pub mod repair;
 pub mod shim;
 pub mod state;
 pub mod tui;

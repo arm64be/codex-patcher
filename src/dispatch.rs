@@ -52,21 +52,6 @@ pub fn inject_managed_update_override(arguments: &[OsString]) -> Vec<OsString> {
     output
 }
 
-/// Whether the initiating interactive Codex launch explicitly selected its
-/// dangerous approval-and-sandbox bypass mode. Only real CLI options before a
-/// `--` delimiter count; prompt text must never be able to enable this mode.
-fn invocation_uses_yolo_mode(arguments: &[OsString]) -> bool {
-    arguments
-        .iter()
-        .take_while(|argument| *argument != OsStr::new("--"))
-        .any(|argument| {
-            matches!(
-                argument.to_str(),
-                Some("--yolo" | "--dangerously-bypass-approvals-and-sandbox")
-            )
-        })
-}
-
 /// Determine whether a Codex invocation is one of the TUI entry points where
 /// it is safe to stop and ask about a detected upstream update.
 pub fn is_interactive_invocation(arguments: &[OsString]) -> bool {
@@ -383,11 +368,6 @@ fn append_windows_argument(output: &mut Vec<u16>, argument: &[u16]) {
 }
 
 pub fn dispatch(paths: &PatcherPaths, arguments: &[OsString]) -> Result<i32> {
-    if std::env::var_os("CODEX_PATCHER_MAINTENANCE").is_some() {
-        bail!(
-            "codex-patcher dispatcher recursion is disabled inside a patch-maintenance session; use the pinned executable named in the repair prompt"
-        );
-    }
     let store = StateStore::new(paths.clone());
 
     if let Some(update) = wrapped_update(arguments)? {
@@ -820,7 +800,6 @@ fn record_failure(
             created_at: existing
                 .map(|record| record.created_at)
                 .unwrap_or_else(Utc::now),
-            repair_worktree: existing.and_then(|record| record.repair_worktree.clone()),
         };
         state.failure = Some(record);
         state.probe = probe_state(ProbeKind::Failed, desired, Some(&failure.to_string()));
@@ -883,7 +862,6 @@ pub fn handle_interactive_failure(
     state: &InstallState,
     original_arguments: Option<&[OsString]>,
 ) -> Result<i32> {
-    let yolo_mode = original_arguments.is_some_and(invocation_uses_yolo_mode);
     let failure = state.failure.as_ref();
     let active = state.active.as_ref();
     let desired_version = failure
@@ -917,30 +895,10 @@ pub fn handle_interactive_failure(
         log_path: failure
             .map(|record| record.log_path.clone())
             .unwrap_or_else(|| paths.logs_dir().join("runtime.log")),
-        last_good_version: failure
-            .and(active)
-            .map(|generation| generation.source.version.clone()),
     };
+    let _ = original_arguments;
     match crate::tui::prompt_failure(&screen)? {
-        FailureChoice::Repair if active.is_some() && failure.is_some() => {
-            let store = StateStore::new(paths.clone());
-            let _manager_lock = store.manager_lock()?;
-            store.recover_surface_transactions()?;
-            let generation = crate::repair::run_repair_session_with_options(
-                paths,
-                failure.expect("checked above"),
-                crate::repair::RunRepairOptions {
-                    yolo_mode,
-                    ..crate::repair::RunRepairOptions::default()
-                },
-            )?;
-            if let Some(arguments) = original_arguments {
-                run_active(paths, &generation, arguments)
-            } else {
-                Ok(0)
-            }
-        }
-        FailureChoice::Repair | FailureChoice::Exit => Ok(75),
+        FailureChoice::Exit => Ok(75),
     }
 }
 
@@ -1107,17 +1065,6 @@ mod tests {
             "app-server"
         ])));
         assert!(!is_interactive_invocation(&args(&["--version"])));
-    }
-
-    #[test]
-    fn repair_yolo_inheritance_only_recognizes_real_cli_flags() {
-        assert!(invocation_uses_yolo_mode(&args(&["--yolo", "fix it"])));
-        assert!(invocation_uses_yolo_mode(&args(&[
-            "fix it",
-            "--dangerously-bypass-approvals-and-sandbox"
-        ])));
-        assert!(!invocation_uses_yolo_mode(&args(&["fix --yolo"])));
-        assert!(!invocation_uses_yolo_mode(&args(&["--", "--yolo"])));
     }
 
     #[test]

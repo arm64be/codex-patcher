@@ -72,7 +72,6 @@ pub struct FailureRecord {
     pub failed_patch: Option<String>,
     pub log_path: PathBuf,
     pub created_at: DateTime<Utc>,
-    pub repair_worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

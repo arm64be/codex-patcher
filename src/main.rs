@@ -11,7 +11,6 @@ use codex_patcher::dispatch::{
 use codex_patcher::elevation;
 use codex_patcher::patchset::PatchSet;
 use codex_patcher::paths::{PatcherPaths, display_user_path};
-use codex_patcher::repair;
 use codex_patcher::shim::{
     RepairOutcome, apply_codex_update_manager_disable, finalize_redirect, finalize_repair_redirect,
     finalize_uninstall_redirect, inspect_codex_update_manager, matches_recorded_shim,
@@ -77,8 +76,6 @@ enum ManagerCommand {
         #[arg(long)]
         accept_force_push: bool,
     },
-    /// Resume maintenance for a recorded failed generation.
-    Repair { failure_id: Option<String> },
     /// Reapply externally overwritten dispatcher surfaces.
     RepairShims {
         #[arg(long)]
@@ -143,7 +140,6 @@ fn real_main() -> Result<()> {
                 interactive: terminal_interactive(),
             },
         ),
-        ManagerCommand::Repair { failure_id } => repair_command(&paths, failure_id.as_deref()),
         ManagerCommand::RepairShims { adopt_drift, yes } => repair_shims(&paths, adopt_drift, yes),
         ManagerCommand::Uninstall { yes } => uninstall(&paths, yes),
         ManagerCommand::Gc => gc(&paths),
@@ -1012,23 +1008,6 @@ fn pending_ownership_journals(paths: &PatcherPaths) -> Result<Vec<PathBuf>> {
     Ok(journals)
 }
 
-fn repair_command(paths: &PatcherPaths, failure_id: Option<&str>) -> Result<()> {
-    let store = StateStore::new(paths.clone());
-    let _manager_lock = store.manager_lock()?;
-    store.recover_surface_transactions()?;
-    let state = store.require()?;
-    let failure = state
-        .failure
-        .as_ref()
-        .context("there is no recorded failure")?;
-    if let Some(failure_id) = failure_id
-        && failure.id != failure_id
-    {
-        bail!("recorded failure is {}, not {failure_id}", failure.id);
-    }
-    repair::run_repair_session(paths, failure)
-}
-
 fn repair_shims(paths: &PatcherPaths, adopt_drift: bool, yes: bool) -> Result<()> {
     let store = StateStore::new(paths.clone());
     let _manager_lock = store.manager_lock()?;
@@ -1175,13 +1154,6 @@ fn gc(paths: &PatcherPaths) -> Result<()> {
     if let Some(previous) = state.previous.as_ref() {
         retained.insert(previous.id.clone());
     }
-    let repair_in_progress = fs::read_dir(paths.worktrees_dir())?
-        .filter_map(Result::ok)
-        .any(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(".repair-") && name.ends_with(".json")
-        });
     let root = paths.generations_dir();
     if !root.exists() {
         return Ok(());
@@ -1200,10 +1172,6 @@ fn gc(paths: &PatcherPaths) -> Result<()> {
             continue;
         }
         if retained.contains(&name) {
-            continue;
-        }
-        if repair_in_progress {
-            println!("retained generation {name} for an unfinished repair session");
             continue;
         }
         if generation_in_use(paths, &entry.path()) {

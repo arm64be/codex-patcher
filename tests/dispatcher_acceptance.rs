@@ -163,7 +163,7 @@ fn noninteractive_error_policy_refuses_pending_generation() {
 }
 
 #[test]
-fn noninteractive_failure_prints_log_and_repair_command_without_protocol_output() {
+fn noninteractive_failure_prints_log_and_retry_command_without_protocol_output() {
     let fixture = DispatcherFixture::new("error", "error");
     fixture.set_auto_rebuild(false);
     let desired = fixture.changed_patch_desired();
@@ -178,7 +178,6 @@ fn noninteractive_failure_prints_log_and_repair_command_without_protocol_output(
         failed_patch: Some("feature.patch".to_owned()),
         log_path: log_path.clone(),
         created_at: Utc::now(),
-        repair_worktree: None,
     });
     state.probe.kind = ProbeKind::Failed;
     state.probe.desired = Some(desired);
@@ -191,7 +190,7 @@ fn noninteractive_failure_prints_log_and_repair_command_without_protocol_output(
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("patch 2 no longer applies"));
     assert!(stderr.contains(&log_path.display().to_string()));
-    assert!(stderr.contains("codex-patcher repair failure-123"));
+    assert!(stderr.contains("codex-patcher update --retry"));
 }
 
 #[test]

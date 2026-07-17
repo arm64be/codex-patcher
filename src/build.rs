@@ -611,62 +611,6 @@ fn build_worktree_dir(paths: &PatcherPaths, desired: &DesiredBuild) -> Result<Pa
         .join(format!("build-{}-{CARGO_PROFILE}", desired.target)))
 }
 
-/// Materialize the already-resolved source in a persistent repair worktree.
-///
-/// Repair prefers the source-key ref retained by the original build. If that
-/// ref is not present (for example, the failure happened before checkout), it
-/// performs the same exact-ref fetch as a normal build and verifies both the
-/// tag object and peeled commit before creating the worktree. The caller owns
-/// the global build lock and the lifetime of the resulting worktree.
-pub(crate) fn prepare_repair_worktree(
-    paths: &PatcherPaths,
-    desired: &DesiredBuild,
-    worktree: &Path,
-    log: &mut File,
-) -> Result<()> {
-    ensure_mirror(paths, log)?;
-    let destination = format!("refs/codex-patcher/source/{}", &desired.source_key[..16]);
-    let cached = (|| {
-        let object = git_bare_output(paths, ["rev-parse", &destination])?
-            .trim()
-            .to_string();
-        let peeled = git_bare_output(paths, ["rev-parse", &format!("{destination}^{{commit}}")])?
-            .trim()
-            .to_string();
-        Ok::<_, anyhow::Error>((object, peeled))
-    })();
-    let identity = match cached {
-        Ok(identity)
-            if identity.0 == desired.source.ref_object_oid
-                && identity.1 == desired.source.commit_oid =>
-        {
-            identity
-        }
-        _ => fetch_source(paths, desired, log)?,
-    };
-    if identity.0 != desired.source.ref_object_oid || identity.1 != desired.source.commit_oid {
-        bail!(
-            "repair source identity changed: expected {}/{}, got {}/{}",
-            desired.source.ref_object_oid,
-            desired.source.commit_oid,
-            identity.0,
-            identity.1
-        );
-    }
-    remove_repair_worktree(paths, worktree, log)?;
-    add_worktree(paths, worktree, &desired.source.commit_oid, log)?;
-    verify_workspace_version(worktree, desired)
-}
-
-/// Remove a persistent repair worktree from both Git's registry and disk.
-pub(crate) fn remove_repair_worktree(
-    paths: &PatcherPaths,
-    worktree: &Path,
-    log: &mut File,
-) -> Result<()> {
-    remove_registered_worktree(paths, worktree, log)
-}
-
 fn remove_registered_worktree(paths: &PatcherPaths, worktree: &Path, log: &mut File) -> Result<()> {
     let output = Command::new("git")
         .arg("--git-dir")

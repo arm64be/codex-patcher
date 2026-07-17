@@ -187,7 +187,7 @@ fn record_desired(
             desired: Some(desired),
             message: if let Some(summary) = cached_failure {
                 Some(format!(
-                    "cached build failure for this patch set: {summary}; use `codex-patcher update --retry` or repair it"
+                    "cached build failure for this patch set: {summary}; use `codex-patcher update --retry`"
                 ))
             } else {
                 message

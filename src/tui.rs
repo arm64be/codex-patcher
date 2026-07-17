@@ -118,12 +118,10 @@ pub struct FailureScreen {
     pub failed_patch_index: Option<usize>,
     pub failed_patch: Option<String>,
     pub log_path: PathBuf,
-    pub last_good_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureChoice {
-    Repair,
     Exit,
 }
 
@@ -196,19 +194,14 @@ pub fn prompt_failure_with_options(
     options: RenderOptions,
 ) -> Result<FailureChoice> {
     let mut terminal = TerminalSession::enter()?;
-    let option_count = usize::from(screen.last_good_version.is_some()) + 1;
     let mut selected = 0;
     loop {
         terminal.draw_failure(screen, selected, options)?;
         let Event::Key(key) = event::read().context("reading failure prompt input")? else {
             continue;
         };
-        if let Some(choice) = failure_key(&mut selected, option_count, key) {
-            return Ok(if screen.last_good_version.is_some() {
-                choice
-            } else {
-                FailureChoice::Exit
-            });
+        if let Some(choice) = failure_key(&mut selected, key) {
+            return Ok(choice);
         }
     }
 }
@@ -531,9 +524,8 @@ fn update_key(selected: &mut usize, key: KeyEvent) -> Option<UpdateChoice> {
     })
 }
 
-fn failure_key(selected: &mut usize, option_count: usize, key: KeyEvent) -> Option<FailureChoice> {
-    menu_key(selected, option_count, key).map(|choice| match choice {
-        MenuChoice::Select(0) if option_count == 2 => FailureChoice::Repair,
+fn failure_key(selected: &mut usize, key: KeyEvent) -> Option<FailureChoice> {
+    menu_key(selected, 1, key).map(|choice| match choice {
         MenuChoice::Select(_) | MenuChoice::Exit => FailureChoice::Exit,
     })
 }
@@ -658,18 +650,7 @@ fn failure_styled_lines(
         ),
     ]));
     lines.push(Line::from(""));
-    if let Some(version) = &screen.last_good_version {
-        lines.push(selection_line(
-            marker,
-            1,
-            &format!("Repair with last-good Codex {version}"),
-            selected == 0,
-            cyan,
-        ));
-        lines.push(selection_line(marker, 2, "Exit", selected == 1, cyan));
-    } else {
-        lines.push(selection_line(marker, 1, "Exit", true, cyan));
-    }
+    lines.push(selection_line(marker, 1, "Exit", selected == 0, cyan));
     lines
 }
 
@@ -1055,15 +1036,7 @@ mod tests {
         assert_eq!(update_key(&mut selected, released), None);
 
         assert_eq!(
-            failure_key(&mut selected, 2, key(KeyCode::Char('1'))),
-            Some(FailureChoice::Repair)
-        );
-        assert_eq!(
-            failure_key(&mut selected, 2, key(KeyCode::Char('2'))),
-            Some(FailureChoice::Exit)
-        );
-        assert_eq!(
-            failure_key(&mut selected, 1, key(KeyCode::Char('1'))),
+            failure_key(&mut selected, key(KeyCode::Char('1'))),
             Some(FailureChoice::Exit)
         );
     }
@@ -1147,10 +1120,8 @@ mod tests {
             failed_patch_index: None,
             failed_patch: Some("0001.patch".into()),
             log_path: PathBuf::from("/tmp/build.log"),
-            last_good_version: None,
         };
         let rendered = render_failure_80x12(&screen, RenderOptions::plain_ascii());
         assert!(rendered.contains("> 1. Exit"));
-        assert!(!rendered.contains("Repair with"));
     }
 }
