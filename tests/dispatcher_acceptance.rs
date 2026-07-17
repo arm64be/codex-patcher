@@ -2,6 +2,7 @@ mod common;
 
 use chrono::Utc;
 use codex_patcher::dispatch::{MANAGED_UPDATE_OVERRIDE, inject_managed_update_override};
+use codex_patcher::probe;
 use codex_patcher::types::{FailureRecord, ProbeKind};
 use common::{DispatcherFixture, line_count, source_version};
 use std::ffi::OsString;
@@ -98,22 +99,36 @@ fn cached_synchronous_freshness_check_keeps_launch_fast() {
     fs::write(fixture.paths.remote_cache_file(), b"not valid JSON")
         .expect("poison remote cache that a warm launch must not parse");
     let state_before = fs::read(fixture.paths.state_file()).expect("read warm state");
-    let started = Instant::now();
-    let output = fixture.run(["app-server"], |command| {
-        command.env("CODEX_PATCHER_TEST_STDOUT", "ready\n");
-    });
-    let launch_time = started.elapsed();
 
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(output.stdout, b"ready\n");
+    let started = Instant::now();
+    let refreshed = probe::refresh(&fixture.paths).expect("run cached freshness check");
+    let refresh_time = started.elapsed();
+
+    assert!(matches!(refreshed.probe.kind, ProbeKind::Current));
+    assert_eq!(
+        refreshed.active.as_ref().map(|active| &active.source_key),
+        Some(&fixture.active.source_key)
+    );
+    assert!(
+        refresh_time < Duration::from_millis(50),
+        "cached freshness work took {refresh_time:?}"
+    );
     assert_eq!(
         fs::read(fixture.paths.state_file()).expect("reread warm state"),
         state_before,
         "a cached launch should not rewrite durable state"
     );
-    assert!(
-        launch_time < Duration::from_millis(250),
-        "launch spent {launch_time:?} on cached freshness work"
+
+    let output = fixture.run(["app-server"], |command| {
+        command.env("CODEX_PATCHER_TEST_STDOUT", "ready\n");
+    });
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"ready\n");
+    assert_eq!(
+        fs::read(fixture.paths.state_file()).expect("reread post-launch state"),
+        state_before,
+        "the wrapper should preserve cached durable state"
     );
 }
 
