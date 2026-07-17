@@ -35,6 +35,7 @@ schema = 1
 branch = "stable"
 target = "native"
 failure_mode = "error"
+auto_rebuild_patches = true
 noninteractive_pending = "auto"
 ```
 
@@ -47,6 +48,11 @@ target and native build tools are installed.
 
 - `error` stops instead of running an older generation.
 - `last-good` keeps using the last validated generation when that is safe.
+
+`auto_rebuild_patches` defaults to `true`, including for existing configs that
+omit it. When only the local patch stack changes, the next managed Codex launch
+rebuilds and activates that same Codex version before starting it. Set it to
+`false` to require the normal update prompt or noninteractive policy instead.
 
 `noninteractive_pending` controls service and protocol launches when an update is
 waiting:
@@ -71,18 +77,25 @@ running.
 
 There is no daemon or watcher. A wrapped `codex` launch does three small things:
 
-1. Reads the last saved update check.
-2. Starts one detached background probe if another probe is not already running.
-3. Immediately runs the active validated generation, or shows an update prompt
-   if a previous probe found new source.
+1. Fingerprints the live config and patch stack.
+2. Reuses the recorded upstream result until its HTTP polling floor expires;
+   when revalidation is due, resolves it synchronously with a three-second total
+   network budget.
+3. Runs the active validated generation, automatically rebuilds a same-version
+   patch change, or shows an update prompt for a new Codex source.
 
-The probe never builds anything for the launch that started it. If launch A finds
-an update in the background, launch B is the first one that can offer to build
-it.
+Patch edits and upstream changes are therefore acted on by the same launch that
+detects them. An ordinary warm launch reads the small state, config, and patch
+inputs but does not parse the upstream HTTP cache or rewrite state. If GitHub is
+temporarily unreachable when revalidation is due, the launch uses the last
+trusted cached response and waits briefly before retrying; a local patch change
+can still rebuild against the active Codex source.
 
-Interactive launches show a Codex-style prompt. Service, protocol, and other
-noninteractive launches follow `noninteractive_pending`. A wrapped
-`codex update` is routed to `codex-patcher update`.
+Interactive launches show a Codex-style prompt for source or configuration
+changes that are not eligible for automatic patch rebuilding. Service,
+protocol, and other noninteractive launches follow `noninteractive_pending`
+when an update cannot be applied automatically. A wrapped `codex update` is
+routed to `codex-patcher update`.
 
 Arguments, working directory, environment, stdio, signals, and exit status are
 preserved. Codex's own startup update prompt is disabled inside managed
@@ -137,7 +150,10 @@ Builds use the upstream package builder and run with the current user's
 privileges. Patch application is strict: `git apply --check` followed by
 `git apply --index`, with no fuzzy or three-way fallback.
 
-Compiler output is kept in a persistent `CARGO_TARGET_DIR` partitioned by
-compatible target, Cargo profile, and toolchain identity. Build failures and
+Patched Codex generations use upstream's `dev-small` profile, which is intended
+for fast local iteration and does not run release ThinLTO after every patch.
+The checkout path and `CARGO_TARGET_DIR` are stable for each compatible target
+and profile, allowing Cargo to reuse real incremental artifacts instead of
+treating every generated worktree as a new workspace. Build failures and
 garbage collection do not delete that cache; uninstall waits for active builds
 before removing it.

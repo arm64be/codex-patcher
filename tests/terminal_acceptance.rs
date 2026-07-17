@@ -16,7 +16,8 @@ enum TerminalEvent {
 #[test]
 fn interactive_update_restores_a_native_pty_or_conpty() {
     let fixture = DispatcherFixture::new("error", "error");
-    fixture.save_state(&fixture.pending_state("patched update pending"));
+    fixture.set_auto_rebuild(false);
+    fixture.changed_patch_desired();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 8,

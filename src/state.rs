@@ -261,10 +261,6 @@ impl StateStore {
         Ok(self.recover_takeovers()? + self.recover_repairs()? + self.recover_restores()?)
     }
 
-    pub fn try_probe_lock(&self) -> Result<Option<LockGuard>> {
-        self.try_lock(&self.paths.probe_lock, "probe state")
-    }
-
     fn lock(&self, path: &Path, label: &str) -> Result<LockGuard> {
         self.paths.ensure()?;
         let file = open_lock(path)?;

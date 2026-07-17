@@ -54,6 +54,10 @@ pub enum ProbeKind {
 pub struct ProbeState {
     pub kind: ProbeKind,
     pub checked_at: Option<DateTime<Utc>>,
+    /// Earliest instant at which upstream freshness must be revalidated.
+    /// Local config and patch inputs are still inspected on every launch.
+    #[serde(default)]
+    pub next_check_at: Option<DateTime<Utc>>,
     pub desired: Option<DesiredBuild>,
     pub message: Option<String>,
 }

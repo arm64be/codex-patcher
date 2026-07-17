@@ -65,7 +65,6 @@ pub struct PatcherPaths {
     pub locks_dir: PathBuf,
     pub manager_lock: PathBuf,
     pub state_lock: PathBuf,
-    pub probe_lock: PathBuf,
     pub build_lock: PathBuf,
     pub logs_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -127,7 +126,6 @@ impl PatcherPaths {
             state: state_dir.join("state.json"),
             manager_lock: locks_dir.join("manager.lock"),
             state_lock: locks_dir.join("state.lock"),
-            probe_lock: locks_dir.join("probe.lock"),
             build_lock: locks_dir.join("build.lock"),
             mirror_dir: cache_dir.join("upstream.git"),
             worktrees_dir: cache_dir.join("worktrees"),
@@ -197,10 +195,6 @@ impl PatcherPaths {
 
     pub fn state_lock(&self) -> PathBuf {
         self.state_lock.clone()
-    }
-
-    pub fn probe_lock(&self) -> PathBuf {
-        self.probe_lock.clone()
     }
 
     pub fn build_lock(&self) -> PathBuf {

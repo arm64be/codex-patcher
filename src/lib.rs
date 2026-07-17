@@ -15,5 +15,5 @@ pub mod upstream;
 
 pub const STATE_SCHEMA: u32 = 1;
 pub const CONFIG_SCHEMA: u32 = 1;
-pub const BUILD_RECIPE_VERSION: u32 = 1;
+pub const BUILD_RECIPE_VERSION: u32 = 2;
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/openai/codex.git";

@@ -219,7 +219,7 @@ pub fn run_repair_session_with_options(
             }
         }
         bail!(
-            "live patch inputs changed after failure {}; wait for the new probe result or retry update",
+            "live patch inputs changed after failure {}; launch Codex again or retry update",
             failure.id
         );
     }
@@ -1007,6 +1007,7 @@ fn activate_repaired_generation(
         latest.probe = ProbeState {
             kind: ProbeKind::Current,
             checked_at: Some(Utc::now()),
+            next_check_at: None,
             desired: Some(desired.clone()),
             message: None,
         };

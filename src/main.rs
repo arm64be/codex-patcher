@@ -11,7 +11,6 @@ use codex_patcher::dispatch::{
 use codex_patcher::elevation;
 use codex_patcher::patchset::PatchSet;
 use codex_patcher::paths::{PatcherPaths, display_user_path};
-use codex_patcher::probe;
 use codex_patcher::repair;
 use codex_patcher::shim::{
     RepairOutcome, apply_codex_update_manager_disable, finalize_redirect, finalize_repair_redirect,
@@ -94,8 +93,6 @@ enum ManagerCommand {
     },
     /// Delete unused immutable generations and abandoned staging directories.
     Gc,
-    #[command(hide = true, name = "__probe")]
-    InternalProbe,
 }
 
 fn main() {
@@ -113,9 +110,6 @@ fn real_main() -> Result<()> {
     let paths = PatcherPaths::discover()?;
     if raw.get(1).is_some_and(|argument| argument == "__dispatch") {
         return finish(dispatch(&paths, raw.get(2..).unwrap_or_default())?);
-    }
-    if raw.get(1).is_some_and(|argument| argument == "__probe") {
-        return probe::run_internal(&paths);
     }
     if invoked_as_codex(raw.first()) {
         return finish(dispatch(&paths, raw.get(1..).unwrap_or_default())?);
@@ -153,7 +147,6 @@ fn real_main() -> Result<()> {
         ManagerCommand::RepairShims { adopt_drift, yes } => repair_shims(&paths, adopt_drift, yes),
         ManagerCommand::Uninstall { yes } => uninstall(&paths, yes),
         ManagerCommand::Gc => gc(&paths),
-        ManagerCommand::InternalProbe => probe::run_internal(&paths),
     }
 }
 
@@ -161,6 +154,7 @@ const QUICKSTART_CONFIG: &str = r#"schema = 1
 branch = "stable"
 target = "native"
 failure_mode = "error"
+auto_rebuild_patches = true
 noninteractive_pending = "auto"
 "#;
 
@@ -201,7 +195,8 @@ there, one relative path per line.
 Use this workflow:
 
 1. Edit or add patch files here.
-2. Run `codex-patcher update --retry` to rebuild the patched Codex generation.
+2. Start managed `codex`; by default it rebuilds immediately when only patches
+   changed. Run `codex-patcher update --retry` to force a retry after failure.
 3. Run `/status` in Codex and check the `Codex Patcher` line when using the
    starter patch.
 
@@ -947,7 +942,7 @@ fn status(paths: &PatcherPaths, json: bool) -> Result<()> {
             &previous.source.commit_oid[..12]
         );
     }
-    println!("probe: {:?}", state.probe.kind);
+    println!("freshness: {:?}", state.probe.kind);
     if let Some(desired) = state.probe.desired.as_ref() {
         println!(
             "desired: Codex {} {} ({}) patches {}",
@@ -958,7 +953,7 @@ fn status(paths: &PatcherPaths, json: bool) -> Result<()> {
         );
     }
     if let Some(message) = state.probe.message.as_deref() {
-        println!("probe detail: {message}");
+        println!("freshness detail: {message}");
     }
     if let Some(failure) = state.failure.as_ref() {
         println!(

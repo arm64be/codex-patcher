@@ -2,155 +2,29 @@ use crate::paths::PatcherPaths;
 use crate::{
     config::Config,
     patchset::PatchSet,
-    state::StateStore,
+    state::{InstallState, StateStore},
     types::{DesiredBuild, ProbeKind, ProbeState},
-    upstream::{ResolveOptions, resolve},
+    upstream::{ResolveOptions, resolve_with_outcome},
 };
-use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use anyhow::Result;
+use chrono::{DateTime, TimeDelta, Utc};
 use std::fs::OpenOptions;
-use std::process::{Command, Stdio};
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
 
-pub fn spawn_detached(paths: &PatcherPaths) -> Result<()> {
-    let manager = paths.manager_binary();
-    if !manager.is_file() {
-        bail!(
-            "installed codex-patcher manager is missing: {}",
-            manager.display()
-        );
-    }
-    paths.ensure()?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.logs_dir().join("probe.log"))?;
-    let mut command = Command::new(manager);
-    command
-        .arg("__probe")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .env("CODEX_PATCHER_INTERNAL", "probe");
+const LAUNCH_NETWORK_BUDGET: Duration = Duration::from_secs(3);
+const UNREACHABLE_RETRY_SECONDS: i64 = 30;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let child = libc::fork();
-                if child == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if child > 0 {
-                    libc::_exit(0);
-                }
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
-        };
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-
-    // std::process uses CreateProcessW with handle inheritance enabled when
-    // redirecting stdio. Without this guard, a detached probe can also inherit
-    // the dispatcher's unrelated stdout/stderr pipes and keep callers waiting
-    // for EOF until the probe exits.
-    #[cfg(windows)]
-    let standard_handles = WindowsStandardHandleInheritanceGuard::new()?;
-    let child = command
-        .spawn()
-        .context("spawning detached freshness probe")?;
-    #[cfg(windows)]
-    drop(standard_handles);
-    #[cfg(unix)]
-    {
-        let mut child = child;
-        child
-            .wait()
-            .context("reaping detached freshness-probe intermediary")?;
-    }
-    #[cfg(not(unix))]
-    drop(child);
-    Ok(())
-}
-
-#[cfg(windows)]
-struct WindowsStandardHandleInheritanceGuard {
-    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
-}
-
-#[cfg(windows)]
-impl WindowsStandardHandleInheritanceGuard {
-    fn new() -> Result<Self> {
-        use windows_sys::Win32::Foundation::{
-            GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-        };
-        use windows_sys::Win32::System::Console::{
-            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        };
-
-        let mut guard = Self {
-            handles: Vec::new(),
-        };
-        for (name, kind) in [
-            ("stdin", STD_INPUT_HANDLE),
-            ("stdout", STD_OUTPUT_HANDLE),
-            ("stderr", STD_ERROR_HANDLE),
-        ] {
-            let handle = unsafe { GetStdHandle(kind) };
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE || guard.handles.contains(&handle)
-            {
-                continue;
-            }
-            let mut flags = 0;
-            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("inspect inherited {name} handle"));
-            }
-            if flags & HANDLE_FLAG_INHERIT == 0 {
-                continue;
-            }
-            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("suppress {name} inheritance for detached probe"));
-            }
-            guard.handles.push(handle);
-        }
-        Ok(guard)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsStandardHandleInheritanceGuard {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-
-        for handle in self.handles.drain(..) {
-            unsafe {
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-            }
-        }
-    }
-}
-
-pub fn run_internal(paths: &PatcherPaths) -> Result<()> {
+/// Resolve all local and remote freshness inputs before a managed Codex launch.
+///
+/// Local patch changes are never deferred. GitHub work uses the normal HTTP
+/// cache and a small total network budget; if GitHub is unreachable, expired
+/// cached responses remain usable and an active source can still be rebuilt
+/// with a changed local patch stack.
+pub fn refresh(paths: &PatcherPaths) -> Result<InstallState> {
     let store = StateStore::new(paths.clone());
-    let Some(_probe_lock) = store.try_probe_lock()? else {
-        return Ok(());
-    };
-    let Some(_manager_lock) = store.try_manager_lock()? else {
-        return Ok(());
-    };
+    let _manager_lock = store.manager_lock()?;
     let initial = store.require()?;
 
     let inputs = (|| {
@@ -165,54 +39,124 @@ pub fn run_internal(paths: &PatcherPaths) -> Result<()> {
             return record_local_failure(&store, &initial.patch_dir, error);
         }
     };
-    let source = match resolve(
+
+    if cached_remote_freshness_is_valid(&initial, &config, &patches, &target, Utc::now()) {
+        return Ok(initial);
+    }
+
+    let fallback = initial.active.as_ref().and_then(|active| {
+        (active.source.channel == config.branch.as_str() && active.target == target).then(|| {
+            DesiredBuild {
+                source_key: patches.source_key(&active.source, &target),
+                patch_fingerprint: patches.fingerprint.clone(),
+                source: active.source.clone(),
+                target: target.clone(),
+            }
+        })
+    });
+    let outcome = resolve_with_outcome(
         config.branch,
         paths.remote_cache_file(),
         initial.resolution_baseline(config.branch.as_str())?,
-        ResolveOptions::default(),
-    ) {
-        Ok(source) => source,
+        ResolveOptions {
+            network_budget: Some(LAUNCH_NETWORK_BUDGET),
+            stale_if_unreachable: true,
+            ..ResolveOptions::default()
+        },
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
         Err(error) => {
-            let message = format!("upstream probe failed: {error:#}");
-            let blocked = message.contains("retag")
-                || message.contains("moved tag")
-                || message.contains("rollback")
-                || message.contains("downgrade")
-                || message.contains("release deletion")
-                || message.contains("non-fast-forward")
-                || message.contains("--accept-force-push");
-            return store.with_state_lock(|| {
-                let mut latest = store.require()?;
-                if latest.patch_dir != initial.patch_dir {
-                    return Ok(());
-                }
-                latest.probe = ProbeState {
-                    kind: if blocked {
-                        ProbeKind::Blocked
-                    } else if latest.active.is_some() {
-                        ProbeKind::Degraded
-                    } else {
-                        ProbeKind::Failed
-                    },
-                    checked_at: Some(Utc::now()),
-                    desired: latest.probe.desired.clone(),
-                    message: Some(message),
-                };
-                store.save(&latest)
-            });
+            let message = format!("upstream freshness check failed: {error:#}");
+            if !resolution_is_blocked(&message)
+                && let Some(desired) = fallback
+            {
+                return record_desired(
+                    &store,
+                    &initial.patch_dir,
+                    desired,
+                    ProbeKind::Degraded,
+                    Some(format!(
+                        "{message}; using the active Codex source for local patch freshness"
+                    )),
+                    Some(retry_check_at()),
+                );
+            }
+            return record_resolution_failure(
+                &store,
+                &initial.patch_dir,
+                message,
+                resolution_is_blocked(&format!("{error:#}")),
+            );
         }
     };
     let desired = DesiredBuild {
-        source_key: patches.source_key(&source, &target),
+        source_key: patches.source_key(&outcome.source, &target),
         patch_fingerprint: patches.fingerprint,
-        source,
+        source: outcome.source,
         target,
     };
+    let message = outcome.used_stale_cache.then(|| {
+        "GitHub was unreachable within the launch budget; used the last cached upstream response"
+            .to_owned()
+    });
+    record_desired(
+        &store,
+        &initial.patch_dir,
+        desired,
+        if outcome.used_stale_cache {
+            ProbeKind::Degraded
+        } else {
+            ProbeKind::Current
+        },
+        message,
+        outcome.next_check_at,
+    )
+}
 
+fn cached_remote_freshness_is_valid(
+    state: &InstallState,
+    config: &Config,
+    patches: &PatchSet,
+    target: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    if !matches!(state.probe.kind, ProbeKind::Current | ProbeKind::Degraded)
+        || state.probe.next_check_at.is_none_or(|next| next <= now)
+    {
+        return false;
+    }
+    let (Some(active), Some(desired)) = (state.active.as_ref(), state.probe.desired.as_ref())
+    else {
+        return false;
+    };
+    let expected_source_key = patches.source_key(&active.source, target);
+    active.source.channel == config.branch.as_str()
+        && active.target == target
+        && active.patch_fingerprint == patches.fingerprint
+        && active.source_key == expected_source_key
+        && desired.source == active.source
+        && desired.target == target
+        && desired.patch_fingerprint == patches.fingerprint
+        && desired.source_key == expected_source_key
+}
+
+fn retry_check_at() -> DateTime<Utc> {
+    Utc::now() + TimeDelta::seconds(UNREACHABLE_RETRY_SECONDS)
+}
+
+fn record_desired(
+    store: &StateStore,
+    expected_patch_dir: &Path,
+    desired: DesiredBuild,
+    current_kind: ProbeKind,
+    message: Option<String>,
+    next_check_at: Option<DateTime<Utc>>,
+) -> Result<InstallState> {
     store.with_state_lock(|| {
         let mut latest = store.require()?;
-        if latest.patch_dir != initial.patch_dir {
-            return Ok(());
+        if latest.patch_dir != expected_patch_dir {
+            return Ok(latest);
         }
         let current = latest
             .active
@@ -221,7 +165,8 @@ pub fn run_internal(paths: &PatcherPaths) -> Result<()> {
         let cached_failure = latest
             .failure
             .as_ref()
-            .is_some_and(|failure| failure.desired.source_key == desired.source_key);
+            .filter(|failure| failure.desired.source_key == desired.source_key)
+            .map(|failure| failure.summary.clone());
         if latest
             .failure
             .as_ref()
@@ -230,41 +175,103 @@ pub fn run_internal(paths: &PatcherPaths) -> Result<()> {
             latest.failure = None;
         }
         latest.probe = ProbeState {
-            kind: if cached_failure {
+            kind: if cached_failure.is_some() {
                 ProbeKind::Failed
             } else if current {
-                ProbeKind::Current
+                current_kind
             } else {
                 ProbeKind::Pending
             },
             checked_at: Some(Utc::now()),
+            next_check_at,
             desired: Some(desired),
-            message: cached_failure.then(|| {
-                "a deterministic failure is cached for this desired source key; use `codex-patcher update --retry` or repair it"
-                    .to_owned()
-            }),
+            message: if let Some(summary) = cached_failure {
+                Some(format!(
+                    "cached build failure for this patch set: {summary}; use `codex-patcher update --retry` or repair it"
+                ))
+            } else {
+                message
+            },
         };
-        store.save(&latest)
+        store.save(&latest)?;
+        Ok(latest)
+    })
+}
+
+fn record_resolution_failure(
+    store: &StateStore,
+    expected_patch_dir: &Path,
+    message: String,
+    blocked: bool,
+) -> Result<InstallState> {
+    append_refresh_log(store, &message);
+    store.with_state_lock(|| {
+        let mut latest = store.require()?;
+        if latest.patch_dir != expected_patch_dir {
+            return Ok(latest);
+        }
+        latest.probe = ProbeState {
+            kind: if blocked {
+                ProbeKind::Blocked
+            } else if latest.active.is_some() {
+                ProbeKind::Degraded
+            } else {
+                ProbeKind::Failed
+            },
+            checked_at: Some(Utc::now()),
+            next_check_at: Some(retry_check_at()),
+            desired: latest.probe.desired.clone(),
+            message: Some(message),
+        };
+        store.save(&latest)?;
+        Ok(latest)
     })
 }
 
 fn record_local_failure(
     store: &StateStore,
-    expected_patch_dir: &std::path::Path,
+    expected_patch_dir: &Path,
     error: anyhow::Error,
-) -> Result<()> {
+) -> Result<InstallState> {
+    append_refresh_log(store, &format!("local patch input is invalid: {error:#}"));
     store.with_state_lock(|| {
         let mut latest = store.require()?;
         if latest.patch_dir != expected_patch_dir {
-            return Ok(());
+            return Ok(latest);
         }
         latest.failure = None;
         latest.probe = ProbeState {
             kind: ProbeKind::Failed,
             checked_at: Some(Utc::now()),
+            next_check_at: None,
             desired: latest.probe.desired.clone(),
             message: Some(format!("local patch input is invalid: {error:#}")),
         };
-        store.save(&latest)
+        store.save(&latest)?;
+        Ok(latest)
     })
+}
+
+fn append_refresh_log(store: &StateStore, message: &str) {
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.paths().logs_dir().join("runtime.log"))
+    {
+        let _ = writeln!(log, "{} {message}", Utc::now().to_rfc3339());
+    }
+}
+
+fn resolution_is_blocked(message: &str) -> bool {
+    [
+        "retag",
+        "moved tag",
+        "rollback",
+        "downgrade",
+        "release deletion",
+        "non-fast-forward",
+        "--accept-force-push",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }

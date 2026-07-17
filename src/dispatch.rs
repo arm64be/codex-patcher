@@ -53,7 +53,7 @@ pub fn inject_managed_update_override(arguments: &[OsString]) -> Vec<OsString> {
 }
 
 /// Determine whether a Codex invocation is one of the TUI entry points where
-/// it is safe to stop and ask about a previously detected update.
+/// it is safe to stop and ask about a detected upstream update.
 pub fn is_interactive_invocation(arguments: &[OsString]) -> bool {
     is_interactive_invocation_with_subcommands(arguments, &[])
 }
@@ -374,9 +374,6 @@ pub fn dispatch(paths: &PatcherPaths, arguments: &[OsString]) -> Result<i32> {
         );
     }
     let store = StateStore::new(paths.clone());
-    // The snapshot is intentionally taken before this invocation starts its
-    // probe. This is the one-launch delay guarantee.
-    let snapshot = store.require()?;
 
     if let Some(update) = wrapped_update(arguments)? {
         if update == WrappedUpdate::Help {
@@ -390,13 +387,7 @@ pub fn dispatch(paths: &PatcherPaths, arguments: &[OsString]) -> Result<i32> {
         return update_and_run(paths, &store, options, None);
     }
 
-    if let Err(error) = probe::spawn_detached(paths) {
-        append_runtime_log(
-            paths,
-            &format!("could not spawn freshness probe: {error:#}"),
-        );
-    }
-
+    let snapshot = probe::refresh(paths)?;
     let validated_subcommands = snapshot
         .active
         .as_ref()
@@ -404,13 +395,35 @@ pub fn dispatch(paths: &PatcherPaths, arguments: &[OsString]) -> Result<i32> {
         .unwrap_or_default();
     let is_tui = terminal_interactive()
         && is_interactive_invocation_with_subcommands(arguments, validated_subcommands);
+
+    if snapshot.probe.kind == ProbeKind::Pending
+        && patch_only_update(&snapshot)
+        && Config::load(snapshot.patch_dir.join("codex-patcher.toml"))?.auto_rebuild_patches
+    {
+        let desired = snapshot
+            .probe
+            .desired
+            .as_ref()
+            .context("pending freshness state has no desired build")?;
+        return update_and_run_desired(
+            paths,
+            &store,
+            UpdateOptions {
+                interactive: is_tui,
+                ..UpdateOptions::default()
+            },
+            desired,
+            arguments,
+        );
+    }
+
     match snapshot.probe.kind {
         ProbeKind::Pending if is_tui => {
             let desired = snapshot
                 .probe
                 .desired
                 .as_ref()
-                .context("pending probe state has no desired build")?;
+                .context("pending freshness state has no desired build")?;
             let active = snapshot
                 .active
                 .as_ref()
@@ -448,18 +461,54 @@ pub fn dispatch(paths: &PatcherPaths, arguments: &[OsString]) -> Result<i32> {
     }
 }
 
+fn patch_only_update(state: &InstallState) -> bool {
+    let (Some(active), Some(desired)) = (state.active.as_ref(), state.probe.desired.as_ref())
+    else {
+        return false;
+    };
+    active.source == desired.source
+        && active.target == desired.target
+        && active.patch_fingerprint != desired.patch_fingerprint
+}
+
 fn update_and_run(
     paths: &PatcherPaths,
     store: &StateStore,
     options: UpdateOptions,
     arguments: Option<&[OsString]>,
 ) -> Result<i32> {
-    match foreground_update(paths, options) {
+    update_and_run_inner(paths, store, options, None, arguments)
+}
+
+fn update_and_run_desired(
+    paths: &PatcherPaths,
+    store: &StateStore,
+    options: UpdateOptions,
+    desired: &DesiredBuild,
+    arguments: &[OsString],
+) -> Result<i32> {
+    update_and_run_inner(paths, store, options, Some(desired), Some(arguments))
+}
+
+fn update_and_run_inner(
+    paths: &PatcherPaths,
+    store: &StateStore,
+    options: UpdateOptions,
+    desired: Option<&DesiredBuild>,
+    arguments: Option<&[OsString]>,
+) -> Result<i32> {
+    let result = match desired {
+        Some(desired) => foreground_update_for_launch(paths, options, desired),
+        None => foreground_update(paths, options),
+    };
+    match result {
         Ok(generation) => arguments.map_or(Ok(0), |args| run_active(paths, &generation, args)),
         Err(error) => {
             append_runtime_log(paths, &format!("foreground update failed: {error:#}"));
             if options.interactive {
                 handle_interactive_failure(paths, &store.require()?, arguments)
+            } else if let Some(arguments) = arguments {
+                apply_noninteractive_policy(paths, &store.require()?, arguments)
             } else {
                 Err(error)
             }
@@ -473,7 +522,18 @@ pub fn foreground_update(paths: &PatcherPaths, options: UpdateOptions) -> Result
     let store = StateStore::new(paths.clone());
     let _manager_lock = store.manager_lock()?;
     store.recover_surface_transactions()?;
-    foreground_update_locked(paths, options)
+    foreground_update_locked_with_desired(paths, options, None)
+}
+
+fn foreground_update_for_launch(
+    paths: &PatcherPaths,
+    options: UpdateOptions,
+    desired: &DesiredBuild,
+) -> Result<GenerationRef> {
+    let store = StateStore::new(paths.clone());
+    let _manager_lock = store.manager_lock()?;
+    store.recover_surface_transactions()?;
+    foreground_update_locked_with_desired(paths, options, Some(desired))
 }
 
 /// Run an update while the caller already owns the manager-operation lock.
@@ -486,16 +546,25 @@ pub fn foreground_update_locked(
     paths: &PatcherPaths,
     options: UpdateOptions,
 ) -> Result<GenerationRef> {
+    foreground_update_locked_with_desired(paths, options, None)
+}
+
+fn foreground_update_locked_with_desired(
+    paths: &PatcherPaths,
+    options: UpdateOptions,
+    launch_desired: Option<&DesiredBuild>,
+) -> Result<GenerationRef> {
     let store = StateStore::new(paths.clone());
     let _build_lock = store.build_lock()?;
     let state = store.require()?;
-    let (config, patches, desired) = match resolve_desired(paths, &state, options) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            record_resolution_problem(&store, &error)?;
-            return Err(error);
-        }
-    };
+    let (config, patches, desired) =
+        match resolve_build_inputs(paths, &state, options, launch_desired) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                record_resolution_problem(&store, &error)?;
+                return Err(error);
+            }
+        };
     if !options.retry
         && let Some(failure) = state
             .failure
@@ -569,13 +638,14 @@ pub fn foreground_update_locked(
         }
     };
     let latest = store.require()?;
-    let (_, live_patches, live_desired) = match resolve_desired(
+    let (_, live_patches, live_desired) = match resolve_build_inputs(
         paths,
         &latest,
         UpdateOptions {
             retry: false,
             ..options
         },
+        launch_desired,
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -605,11 +675,55 @@ pub fn foreground_update_locked(
         if live_config.branch != config.branch || live_config.resolved_target()? != desired.target {
             bail!("build configuration changed before activation");
         }
+        let next_check_at = launch_desired.and_then(|expected| {
+            (latest.probe.desired.as_ref() == Some(expected))
+                .then_some(latest.probe.next_check_at)
+                .flatten()
+        });
         latest.activate(generation.clone());
         latest.probe = probe_state(ProbeKind::Current, &desired, None);
+        latest.probe.next_check_at = next_check_at;
         Ok(())
     })?;
     Ok(generation)
+}
+
+fn resolve_build_inputs(
+    paths: &PatcherPaths,
+    state: &InstallState,
+    options: UpdateOptions,
+    launch_desired: Option<&DesiredBuild>,
+) -> Result<(Config, PatchSet, DesiredBuild)> {
+    let Some(expected) = launch_desired else {
+        return resolve_desired(paths, state, options);
+    };
+    let config = Config::load(state.patch_dir.join("codex-patcher.toml"))?;
+    let patches = PatchSet::load(&state.patch_dir)?;
+    let target = config.resolved_target()?;
+    if config.branch.as_str() != expected.source.channel {
+        bail!(
+            "release channel changed after the launch freshness check (expected {}, found {})",
+            expected.source.channel,
+            config.branch
+        );
+    }
+    if target != expected.target {
+        bail!(
+            "build target changed after the launch freshness check (expected {}, found {})",
+            expected.target,
+            target
+        );
+    }
+    let desired = DesiredBuild {
+        source_key: patches.source_key(&expected.source, &target),
+        patch_fingerprint: patches.fingerprint.clone(),
+        source: expected.source.clone(),
+        target,
+    };
+    if desired != *expected {
+        bail!("patch inputs changed after the launch freshness check");
+    }
+    Ok((config, patches, desired))
 }
 
 fn record_transient_build_problem(
@@ -720,6 +834,7 @@ fn record_resolution_problem(store: &StateStore, error: &anyhow::Error) -> Resul
             ProbeKind::Failed
         };
         state.probe.checked_at = Some(Utc::now());
+        state.probe.next_check_at = None;
         state.probe.message = Some(message);
         Ok(())
     })
@@ -741,6 +856,7 @@ fn probe_state(kind: ProbeKind, desired: &DesiredBuild, message: Option<&str>) -
     ProbeState {
         kind,
         checked_at: Some(Utc::now()),
+        next_check_at: None,
         desired: Some(desired.clone()),
         message: message.map(str::to_owned),
     }
@@ -784,7 +900,7 @@ pub fn handle_interactive_failure(
         failed_patch: failure.and_then(|record| record.failed_patch.clone()),
         log_path: failure
             .map(|record| record.log_path.clone())
-            .unwrap_or_else(|| paths.logs_dir().join("probe.log")),
+            .unwrap_or_else(|| paths.logs_dir().join("runtime.log")),
         last_good_version: failure
             .and(active)
             .map(|generation| generation.source.version.clone()),
@@ -818,7 +934,7 @@ fn apply_noninteractive_policy(
         Ok(config) => config,
         Err(error) => {
             eprintln!(
-                "codex-patcher: invalid live configuration after an earlier probe result: {error:#}"
+                "codex-patcher: invalid live configuration after the freshness check: {error:#}"
             );
             if let Some(detail) = state.probe.message.as_deref() {
                 eprintln!("detail: {detail}");

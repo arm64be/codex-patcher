@@ -9,7 +9,7 @@ use crate::config::Branch;
 use crate::state::atomic_write;
 use crate::types::ResolvedSource;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use regex::Regex;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -19,10 +19,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CACHE_SCHEMA: u32 = 1;
 const FALLBACK_POLL_FLOOR_SECONDS: u64 = 300;
+const UNREACHABLE_RETRY_SECONDS: i64 = 30;
 const MAX_TAG_DEPTH: usize = 8;
 const DEFAULT_API_BASE: &str = "https://api.github.com/repos/openai/codex";
 const GITHUB_ACCEPT: &str = "application/vnd.github+json";
@@ -52,6 +53,13 @@ pub struct ResolveOptions {
     /// Optional GitHub token. If absent, `GITHUB_TOKEN` and then `GH_TOKEN` are
     /// consulted.
     pub token: Option<String>,
+    /// Total time that network requests may consume. Cached responses do not
+    /// consume this budget. `None` retains the normal per-request timeout.
+    pub network_budget: Option<Duration>,
+    /// Reuse an expired cached response when GitHub cannot be reached within
+    /// the network budget. This is intended for the latency-sensitive launch
+    /// path, which can safely keep using the last trusted source.
+    pub stale_if_unreachable: bool,
 }
 
 impl Default for ResolveOptions {
@@ -62,8 +70,17 @@ impl Default for ResolveOptions {
             accept_force_push: false,
             api_base: DEFAULT_API_BASE.to_owned(),
             token: None,
+            network_budget: None,
+            stale_if_unreachable: false,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveOutcome {
+    pub source: ResolvedSource,
+    pub used_stale_cache: bool,
+    pub next_check_at: Option<DateTime<Utc>>,
 }
 
 /// Resolve the newest usable source revision for `branch`.
@@ -76,6 +93,15 @@ pub fn resolve(
     previous_source: Option<&ResolvedSource>,
     options: ResolveOptions,
 ) -> Result<ResolvedSource> {
+    resolve_with_outcome(branch, cache_file, previous_source, options).map(|outcome| outcome.source)
+}
+
+pub fn resolve_with_outcome(
+    branch: Branch,
+    cache_file: impl AsRef<Path>,
+    previous_source: Option<&ResolvedSource>,
+    options: ResolveOptions,
+) -> Result<ResolveOutcome> {
     let mut resolver = Resolver::new(cache_file.as_ref(), options)?;
     let result = (|| {
         if branch != Branch::Nightly && !resolver.options.accept_retag {
@@ -107,7 +133,11 @@ pub fn resolve(
             return Err(error.context(format!("also failed to save HTTP cache: {cache_error:#}")));
         }
     };
-    Ok(source)
+    Ok(ResolveOutcome {
+        source,
+        used_stale_cache: resolver.used_stale_cache,
+        next_check_at: resolver.next_check_at,
+    })
 }
 
 struct Resolver {
@@ -116,6 +146,9 @@ struct Resolver {
     cache_path: PathBuf,
     cache: HttpCache,
     cache_dirty: bool,
+    network_deadline: Option<Instant>,
+    used_stale_cache: bool,
+    next_check_at: Option<DateTime<Utc>>,
 }
 
 impl Resolver {
@@ -135,8 +168,16 @@ impl Resolver {
                 });
         }
 
+        let connect_timeout = options
+            .network_budget
+            .map(|budget| budget.min(Duration::from_secs(15)))
+            .unwrap_or(Duration::from_secs(15))
+            .max(Duration::from_millis(1));
+        let network_deadline = options
+            .network_budget
+            .and_then(|budget| Instant::now().checked_add(budget));
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(15))
+            .connect_timeout(connect_timeout)
             .timeout(Duration::from_secs(60))
             .build()
             .context("failed to construct GitHub HTTP client")?;
@@ -147,6 +188,9 @@ impl Resolver {
             cache_path: cache_path.to_owned(),
             cache,
             cache_dirty: false,
+            network_deadline,
+            used_stale_cache: false,
+            next_check_at: None,
         })
     }
 
@@ -382,9 +426,10 @@ impl Resolver {
 
     fn get(&mut self, url: &str) -> Result<CachedBody> {
         let now = Utc::now();
-        if let Some(cached) = self.cache.entries.get(url)
-            && cache_entry_is_fresh(cached, now, self.options.force)
+        if let Some(cached) = self.cache.entries.get(url).cloned()
+            && cache_entry_is_fresh(&cached, now, self.options.force)
         {
+            self.note_next_check(cached.checked_at, cached.poll_floor_seconds);
             return Ok(cached.body());
         }
 
@@ -402,15 +447,44 @@ impl Resolver {
             request = request.header(IF_NONE_MATCH, etag);
         }
 
-        let response = request
-            .send()
-            .with_context(|| format!("failed to request GitHub endpoint {url}"))?;
+        if let Some(deadline) = self.network_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if self.options.stale_if_unreachable
+                    && let Some(previous) = previous.as_ref()
+                {
+                    self.mark_stale_cache_used();
+                    return Ok(previous.body());
+                }
+                bail!("GitHub freshness check exceeded its network budget");
+            }
+            request = request.timeout(remaining.max(Duration::from_millis(1)));
+        }
+
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(_error) if self.options.stale_if_unreachable && previous.as_ref().is_some() => {
+                self.mark_stale_cache_used();
+                return Ok(previous.as_ref().expect("checked above").body());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to request GitHub endpoint {url}"));
+            }
+        };
         let status = response.status();
+        if self.options.stale_if_unreachable
+            && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            && let Some(previous) = previous.as_ref()
+        {
+            self.mark_stale_cache_used();
+            return Ok(previous.body());
+        }
         let response_etag = header_string(response.headers(), ETAG)?;
         let response_floor = poll_floor(response.headers())?;
 
         if status == StatusCode::NOT_MODIFIED {
-            let mut entry = previous.ok_or_else(|| {
+            let mut entry = previous.clone().ok_or_else(|| {
                 anyhow!("GitHub returned 304 for {url}, but no cached response exists")
             })?;
             entry.checked_at = now;
@@ -419,15 +493,24 @@ impl Resolver {
                 entry.poll_floor_seconds = response_floor;
                 entry.poll_floor_advertised = true;
             }
+            self.note_next_check(entry.checked_at, entry.poll_floor_seconds);
             let body = entry.body();
             self.cache.entries.insert(url.to_owned(), entry);
             self.cache_dirty = true;
             return Ok(body);
         }
 
-        let body = response
-            .text()
-            .with_context(|| format!("failed to read GitHub response body for {url}"))?;
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(_error) if self.options.stale_if_unreachable && previous.as_ref().is_some() => {
+                self.mark_stale_cache_used();
+                return Ok(previous.as_ref().expect("checked above").body());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read GitHub response body for {url}"));
+            }
+        };
         let entry = CacheEntry {
             status: status.as_u16(),
             etag: response_etag,
@@ -436,6 +519,7 @@ impl Resolver {
             poll_floor_advertised: response_floor.is_some(),
             body,
         };
+        self.note_next_check(entry.checked_at, entry.poll_floor_seconds);
         let result = entry.body();
         self.cache.entries.insert(url.to_owned(), entry);
         self.cache_dirty = true;
@@ -449,6 +533,24 @@ impl Resolver {
         self.cache.save(&self.cache_path)?;
         self.cache_dirty = false;
         Ok(())
+    }
+
+    fn note_next_check(&mut self, checked_at: DateTime<Utc>, poll_floor_seconds: u64) {
+        let seconds = i64::try_from(poll_floor_seconds.max(1)).unwrap_or(i64::MAX);
+        let delta = TimeDelta::try_seconds(seconds).unwrap_or(TimeDelta::MAX);
+        let next = checked_at
+            .checked_add_signed(delta)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        self.next_check_at = Some(self.next_check_at.map_or(next, |current| current.min(next)));
+    }
+
+    fn mark_stale_cache_used(&mut self) {
+        self.used_stale_cache = true;
+        let retry = Utc::now() + TimeDelta::seconds(UNREACHABLE_RETRY_SECONDS);
+        self.next_check_at = Some(
+            self.next_check_at
+                .map_or(retry, |current| current.min(retry)),
+        );
     }
 }
 
@@ -934,6 +1036,73 @@ mod tests {
             now,
             true
         ));
+    }
+
+    #[test]
+    fn exhausted_launch_budget_uses_stale_cache_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let mut resolver = Resolver::new(
+            &root.path().join("remote.json"),
+            ResolveOptions {
+                api_base: "https://example.invalid".to_owned(),
+                network_budget: Some(Duration::ZERO),
+                stale_if_unreachable: true,
+                ..ResolveOptions::default()
+            },
+        )
+        .unwrap();
+        let url = "https://example.invalid/endpoint";
+        resolver.cache.entries.insert(
+            url.to_owned(),
+            CacheEntry {
+                status: 200,
+                etag: Some("old".to_owned()),
+                checked_at: Utc::now() - TimeDelta::hours(1),
+                poll_floor_seconds: 300,
+                poll_floor_advertised: false,
+                body: "trusted cached body".to_owned(),
+            },
+        );
+
+        let response = resolver.get(url).unwrap();
+        assert_eq!(response.body, "trusted cached body");
+        assert!(resolver.used_stale_cache);
+        let next_check_at = resolver.next_check_at.expect("stale cache retry time");
+        let retry_in = next_check_at.signed_duration_since(Utc::now());
+        assert!(retry_in >= TimeDelta::seconds(25));
+        assert!(retry_in <= TimeDelta::seconds(30));
+    }
+
+    #[test]
+    fn fresh_cache_records_its_next_revalidation_time() {
+        let root = tempfile::tempdir().unwrap();
+        let mut resolver = Resolver::new(
+            &root.path().join("remote.json"),
+            ResolveOptions {
+                api_base: "https://example.invalid".to_owned(),
+                ..ResolveOptions::default()
+            },
+        )
+        .unwrap();
+        let url = "https://example.invalid/endpoint";
+        let checked_at = Utc::now();
+        resolver.cache.entries.insert(
+            url.to_owned(),
+            CacheEntry {
+                status: 200,
+                etag: Some("current".to_owned()),
+                checked_at,
+                poll_floor_seconds: 300,
+                poll_floor_advertised: false,
+                body: "trusted cached body".to_owned(),
+            },
+        );
+
+        assert_eq!(resolver.get(url).unwrap().body, "trusted cached body");
+        assert_eq!(
+            resolver.next_check_at,
+            Some(checked_at + TimeDelta::seconds(300))
+        );
     }
 
     #[test]

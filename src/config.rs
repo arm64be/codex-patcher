@@ -101,7 +101,13 @@ pub struct Config {
     pub target: TargetSpec,
     #[serde(default)]
     pub failure_mode: FailureMode,
+    #[serde(default = "default_auto_rebuild_patches")]
+    pub auto_rebuild_patches: bool,
     pub noninteractive_pending: NoninteractivePending,
+}
+
+const fn default_auto_rebuild_patches() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -111,6 +117,7 @@ impl Default for Config {
             branch: Branch::Stable,
             target: TargetSpec::OfficialNative,
             failure_mode: FailureMode::Error,
+            auto_rebuild_patches: true,
             noninteractive_pending: NoninteractivePending::Auto,
         }
     }
@@ -226,6 +233,7 @@ mod tests {
             TargetSpec::Triple("x86_64-unknown-linux-gnu".into())
         );
         assert_eq!(config.failure_mode, FailureMode::LastGood);
+        assert!(config.auto_rebuild_patches);
         assert_eq!(
             config.noninteractive_pending,
             NoninteractivePending::WarnRun
@@ -234,6 +242,7 @@ mod tests {
             toml::from_str("schema=1\nbranch=\"stable\"\nnoninteractive_pending=\"auto\"").unwrap();
         assert_eq!(minimal.target, TargetSpec::OfficialNative);
         assert_eq!(minimal.failure_mode, FailureMode::Error);
+        assert!(minimal.auto_rebuild_patches);
         assert!(toml::to_string(&minimal).unwrap().contains("native"));
         let legacy: Config = toml::from_str(
             "schema=1\nbranch=\"stable\"\ntarget=\"official-native\"\n\
@@ -241,6 +250,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.target, TargetSpec::OfficialNative);
+        let disabled: Config = toml::from_str(
+            "schema=1\nbranch=\"stable\"\nauto_rebuild_patches=false\n\
+             noninteractive_pending=\"auto\"",
+        )
+        .unwrap();
+        assert!(!disabled.auto_rebuild_patches);
         assert!(
             toml::from_str::<Config>(
                 "schema=1\nbranch=\"stable\"\nnoninteractive_pending=\"auto\"\nmystery=true"

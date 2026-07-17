@@ -20,7 +20,9 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 use walkdir::WalkDir;
 
-const CARGO_PROFILE: &str = "release";
+// Codex's package builder defines this profile specifically for fast, small
+// local iteration. Unlike `release`, it does not run ThinLTO after every patch.
+const CARGO_PROFILE: &str = "dev-small";
 const MAX_FAILURE_LOG_TAIL: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
@@ -264,14 +266,8 @@ fn build_generation_inner(
 
     *context.failure_phase = "checkout";
     progress(BuildEvent::Phase("checkout"));
-    let worktree = paths
-        .worktrees_dir()
-        .join(format!("build-{}", Uuid::new_v4()));
-    add_worktree(paths, &worktree, &desired.source.commit_oid, &mut log)?;
-    let cleanup = WorktreeCleanup {
-        mirror: paths.mirror_dir(),
-        path: worktree.clone(),
-    };
+    let worktree = build_worktree_dir(paths, desired)?;
+    prepare_build_worktree(paths, &worktree, &desired.source.commit_oid, &mut log)?;
 
     *context.failure_phase = "patch";
     verify_workspace_version(&worktree, desired)?;
@@ -330,6 +326,13 @@ fn build_generation_inner(
         if warm_cache { "warm; reusing" } else { "cold" },
         cargo_target_dir.display()
     )?;
+    writeln!(
+        log,
+        "cargo profile: {CARGO_PROFILE} (local iteration; no LTO)"
+    )?;
+    progress(BuildEvent::Line(format!(
+        "using Codex's {CARGO_PROFILE} profile (incremental, no LTO)"
+    )));
     if warm_cache {
         progress(BuildEvent::Line(
             "reusing persistent incremental compiler artifacts".into(),
@@ -354,6 +357,7 @@ fn build_generation_inner(
         .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("CODEX_PATCHER_CARGO_PROFILE", CARGO_PROFILE)
         .env("CODEX_PATCHER_BUILD", "1");
     let status = run_streaming(&mut command, &mut log, progress)?;
     if !status.success() {
@@ -434,7 +438,6 @@ fn build_generation_inner(
             quarantine.display()
         )?;
     }
-    drop(cleanup);
     Ok(generation)
 }
 
@@ -567,6 +570,47 @@ fn add_worktree(paths: &PatcherPaths, worktree: &Path, commit: &str, log: &mut F
     Ok(())
 }
 
+/// Reuse one stable checkout path per compatible target/profile. Cargo's
+/// workspace fingerprints include absolute source paths, and recreating the
+/// checkout at a random UUID makes every local Codex crate look new. Resetting
+/// the persistent checkout changes mtimes only for source files that actually
+/// differ, so patch-only builds can use Cargo's real incremental cache.
+fn prepare_build_worktree(
+    paths: &PatcherPaths,
+    worktree: &Path,
+    commit: &str,
+    log: &mut File,
+) -> Result<()> {
+    if fs::symlink_metadata(worktree).is_ok_and(|metadata| metadata.is_dir()) {
+        let reset = git_in(worktree, ["reset", "--hard", commit], None, log);
+        let clean = reset.and_then(|()| git_in(worktree, ["clean", "-ffdx"], None, log));
+        if clean.is_ok() {
+            writeln!(log, "reused stable build worktree {}", worktree.display())?;
+            return Ok(());
+        }
+        writeln!(
+            log,
+            "stable build worktree was invalid; recreating {}",
+            worktree.display()
+        )?;
+    }
+    remove_registered_worktree(paths, worktree, log)?;
+    add_worktree(paths, worktree, commit, log)
+}
+
+fn build_worktree_dir(paths: &PatcherPaths, desired: &DesiredBuild) -> Result<PathBuf> {
+    if !desired
+        .target
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("build target contains unsafe path characters");
+    }
+    Ok(paths
+        .worktrees_dir()
+        .join(format!("build-{}-{CARGO_PROFILE}", desired.target)))
+}
+
 /// Materialize the already-resolved source in a persistent repair worktree.
 ///
 /// Repair prefers the source-key ref retained by the original build. If that
@@ -620,29 +664,32 @@ pub(crate) fn remove_repair_worktree(
     worktree: &Path,
     log: &mut File,
 ) -> Result<()> {
-    if worktree.exists() {
-        let output = Command::new("git")
+    remove_registered_worktree(paths, worktree, log)
+}
+
+fn remove_registered_worktree(paths: &PatcherPaths, worktree: &Path, log: &mut File) -> Result<()> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(paths.mirror_dir())
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output()?;
+    log.write_all(&output.stdout)?;
+    log.write_all(&output.stderr)?;
+    if !output.status.success() {
+        // A stale registration can remain after a killed build, and a stale
+        // directory can remain without a registration. Both are patcher-owned.
+        let prune = Command::new("git")
             .arg("--git-dir")
             .arg(paths.mirror_dir())
-            .args(["worktree", "remove", "--force"])
-            .arg(worktree)
+            .args(["worktree", "prune"])
             .output()?;
-        log.write_all(&output.stdout)?;
-        log.write_all(&output.stderr)?;
-        if !output.status.success() {
-            // A stale directory may exist without a registered worktree. Git's
-            // prune plus a direct removal is safe because this path is wholly
-            // patcher-owned and uniquely named for the failure.
-            let _ = Command::new("git")
-                .arg("--git-dir")
-                .arg(paths.mirror_dir())
-                .args(["worktree", "prune"])
-                .output();
-        }
-        if worktree.exists() {
-            fs::remove_dir_all(worktree)
-                .with_context(|| format!("removing repair worktree {}", worktree.display()))?;
-        }
+        log.write_all(&prune.stdout)?;
+        log.write_all(&prune.stderr)?;
+    }
+    if worktree.exists() {
+        fs::remove_dir_all(worktree)
+            .with_context(|| format!("removing worktree {}", worktree.display()))?;
     }
     Ok(())
 }
@@ -819,6 +866,7 @@ fn run_with_timeout<const N: usize>(
     let mut child = Command::new(program)
         .args(args)
         .env("CODEX_HOME", validation_home.path())
+        .env("CODEX_PATCHER_VALIDATION", "1")
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
         .stdin(Stdio::null())
@@ -1050,6 +1098,10 @@ fn build_environment(cargo_target_dir: &Path) -> BTreeMap<String, String> {
         cargo_target_dir.display().to_string(),
     );
     environment.insert("CODEX_PATCHER_BUILD".to_owned(), "1".to_owned());
+    environment.insert(
+        "CODEX_PATCHER_CARGO_PROFILE".to_owned(),
+        CARGO_PROFILE.to_owned(),
+    );
     environment.insert("RUSTFLAGS".to_owned(), "<removed>".to_owned());
     environment.insert("CARGO_ENCODED_RUSTFLAGS".to_owned(), "<removed>".to_owned());
     environment
@@ -1105,31 +1157,12 @@ pub fn sanitize_line(line: &str) -> String {
     output
 }
 
-struct WorktreeCleanup {
-    mirror: PathBuf,
-    path: PathBuf,
-}
-
 struct DirectoryCleanup(PathBuf);
 
 impl Drop for DirectoryCleanup {
     fn drop(&mut self) {
         if self.0.exists() {
             let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-}
-
-impl Drop for WorktreeCleanup {
-    fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("--git-dir")
-            .arg(&self.mirror)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
-        if self.path.exists() {
-            let _ = fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -1244,17 +1277,76 @@ mod tests {
         };
         let first = build_cache_dir(&paths, &first_desired);
         let second = build_cache_dir(&paths, &second_desired);
+        let first_worktree = build_worktree_dir(&paths, &first_desired).unwrap();
+        let second_worktree = build_worktree_dir(&paths, &second_desired).unwrap();
 
         assert_ne!(first_desired.source_key, second_desired.source_key);
         assert_eq!(first, second);
+        assert_eq!(first_worktree, second_worktree);
         assert_eq!(
             first,
             temp.path()
-                .join("cache/cargo-target/x86_64-unknown-linux-gnu/release")
+                .join("cache/cargo-target/x86_64-unknown-linux-gnu/dev-small")
         );
         assert!(!directory_has_entries(&first));
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("compiler-artifact"), b"cached").unwrap();
         assert!(directory_has_entries(&second));
+    }
+
+    #[test]
+    fn stable_build_worktree_is_reset_and_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let git = |directory: &Path, arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&source, &["init"]);
+        git(&source, &["config", "user.name", "Test"]);
+        git(&source, &["config", "user.email", "test@example.invalid"]);
+        fs::write(source.join("tracked.txt"), "base\n").unwrap();
+        git(&source, &["add", "tracked.txt"]);
+        git(&source, &["commit", "-m", "base"]);
+        let commit = String::from_utf8(git(&source, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let paths = PatcherPaths::from_home(temp.path().join("patcher"));
+        fs::create_dir_all(paths.cache_dir()).unwrap();
+        let clone = Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source)
+            .arg(paths.mirror_dir())
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        let worktree = paths.worktrees_dir().join("build-test-dev-small");
+        let mut log = File::create(temp.path().join("worktree.log")).unwrap();
+
+        prepare_build_worktree(&paths, &worktree, &commit, &mut log).unwrap();
+        fs::write(worktree.join("tracked.txt"), "patched\n").unwrap();
+        fs::write(worktree.join("untracked.txt"), "temporary\n").unwrap();
+        prepare_build_worktree(&paths, &worktree, &commit, &mut log).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+        assert!(!worktree.join("untracked.txt").exists());
+        assert!(git(&worktree, &["status", "--porcelain"]).stdout.is_empty());
+        remove_registered_worktree(&paths, &worktree, &mut log).unwrap();
     }
 }
