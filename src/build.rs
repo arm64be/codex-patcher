@@ -275,7 +275,7 @@ fn build_generation_inner(
     for (offset, patch) in patches.patches.iter().enumerate() {
         let index = offset + 1;
         progress(BuildEvent::Line(format!(
-            "applying {index}/{} {}",
+            "Applying {index}/{} {}",
             patches.patches.len(),
             patch.path
         )));
@@ -331,11 +331,11 @@ fn build_generation_inner(
         "cargo profile: {CARGO_PROFILE} (local iteration; no LTO)"
     )?;
     progress(BuildEvent::Line(format!(
-        "using Codex's {CARGO_PROFILE} profile (incremental, no LTO)"
+        "Profile {CARGO_PROFILE} (incremental, no LTO)"
     )));
     if warm_cache {
         progress(BuildEvent::Line(
-            "reusing persistent incremental compiler artifacts".into(),
+            "Cache warm (reusing compiler artifacts)".into(),
         ));
     }
     let (python, prefix) = find_python()?;
@@ -1337,14 +1337,12 @@ mod tests {
         let mut log = File::create(temp.path().join("worktree.log")).unwrap();
 
         prepare_build_worktree(&paths, &worktree, &commit, &mut log).unwrap();
+        let baseline = fs::read(worktree.join("tracked.txt")).unwrap();
         fs::write(worktree.join("tracked.txt"), "patched\n").unwrap();
         fs::write(worktree.join("untracked.txt"), "temporary\n").unwrap();
         prepare_build_worktree(&paths, &worktree, &commit, &mut log).unwrap();
 
-        assert_eq!(
-            fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
-            "base\n"
-        );
+        assert_eq!(fs::read(worktree.join("tracked.txt")).unwrap(), baseline);
         assert!(!worktree.join("untracked.txt").exists());
         assert!(git(&worktree, &["status", "--porcelain"]).stdout.is_empty());
         remove_registered_worktree(&paths, &worktree, &mut log).unwrap();

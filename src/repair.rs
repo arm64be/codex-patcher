@@ -55,8 +55,10 @@ pub fn generate_repair_prompt(context: &RepairPromptContext) -> String {
          Live patch directory (do not edit directly): {}\n\n\
          Work only in this worktree. Resolve rejected hunks and build errors while preserving \
          the intent and order of the existing patch stack. Remove every .rej file and leave the \
-         worktree buildable. Do not commit, amend, rebase, or reset Git history. Do not invoke \
-         codex-patcher or edit the live patch directory; the \
+         worktree buildable. Start with focused offline checks using the existing toolchain and \
+         cache; do not run broad workspace test suites. The outer repair \
+         transaction performs the authoritative package rebuild. Do not commit, amend, rebase, \
+         or reset Git history. Do not invoke codex-patcher or edit the live patch directory; the \
          outer repair transaction will re-export, validate, show the changes, and request \
          confirmation before replacing anything.",
         single_line(&context.failure_id),
@@ -70,17 +72,28 @@ pub fn generate_repair_prompt(context: &RepairPromptContext) -> String {
     )
 }
 
-pub fn maintenance_command(codex_binary: &Path, worktree: &Path, prompt: &str) -> Command {
+pub fn maintenance_command(
+    codex_binary: &Path,
+    worktree: &Path,
+    prompt: &str,
+    yolo_mode: bool,
+) -> Command {
     let mut command = Command::new(codex_binary);
     command
         .arg("-c")
         .arg("check_for_update_on_startup=false")
         .arg("-C")
-        .arg(worktree)
-        .arg("--sandbox")
-        .arg("workspace-write")
-        .arg("--ask-for-approval")
-        .arg("on-request")
+        .arg(worktree);
+    if yolo_mode {
+        command.arg("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+        command
+            .arg("--sandbox")
+            .arg("workspace-write")
+            .arg("--ask-for-approval")
+            .arg("on-request");
+    }
+    command
         .arg("--no-alt-screen")
         .arg(prompt)
         .env(MAINTENANCE_ENV, "1")
@@ -94,6 +107,7 @@ pub fn launch_last_good_codex(
     codex_binary: &Path,
     worktree: &Path,
     prompt: &str,
+    yolo_mode: bool,
 ) -> Result<ExitStatus> {
     ensure!(
         codex_binary.is_file(),
@@ -105,7 +119,7 @@ pub fn launch_last_good_codex(
         "repair worktree does not exist: {}",
         worktree.display()
     );
-    maintenance_command(codex_binary, worktree, prompt)
+    maintenance_command(codex_binary, worktree, prompt, yolo_mode)
         .status()
         .with_context(|| {
             format!(
@@ -126,6 +140,7 @@ pub enum RepairConfirmation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunRepairOptions {
     pub confirmation: RepairConfirmation,
+    pub yolo_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,10 +261,20 @@ pub fn run_repair_session_with_options(
             RepairStage::Applying {
                 conflicted_index: Some(index),
                 ..
-            } => launch_maintenance(&session, failure, Some(*index), &current.patch_dir)?,
-            RepairStage::BuildRepair => {
-                launch_maintenance(&session, failure, None, &current.patch_dir)?
-            }
+            } => launch_maintenance(
+                &session,
+                failure,
+                Some(*index),
+                &current.patch_dir,
+                options.yolo_mode,
+            )?,
+            RepairStage::BuildRepair => launch_maintenance(
+                &session,
+                failure,
+                None,
+                &current.patch_dir,
+                options.yolo_mode,
+            )?,
             RepairStage::ReadyToBuild => break,
             _ => {}
         }
@@ -690,6 +715,7 @@ fn launch_maintenance(
     original_failure: &FailureRecord,
     conflict_index: Option<usize>,
     patch_dir: &Path,
+    yolo_mode: bool,
 ) -> Result<()> {
     let snapshot = PatchSet::load(&session.snapshot_dir)?;
     let failed_patch = conflict_index
@@ -706,7 +732,12 @@ fn launch_maintenance(
         log_path: session.diagnostic_log.clone(),
         patch_dir: patch_dir.to_path_buf(),
     });
-    let _ = launch_last_good_codex(&session.last_good.binary, &session.worktree, &prompt)?;
+    let _ = launch_last_good_codex(
+        &session.last_good.binary,
+        &session.worktree,
+        &prompt,
+        yolo_mode,
+    )?;
     Ok(())
 }
 
@@ -1850,6 +1881,7 @@ mod tests {
             Path::new("/generation/bin/codex"),
             Path::new("/repair/worktree"),
             "repair this",
+            false,
         );
         let args = command
             .get_args()
@@ -1865,6 +1897,21 @@ mod tests {
             command
                 .get_envs()
                 .any(|(key, value)| { key == MAINTENANCE_ENV && value == Some(OsStr::new("1")) })
+        );
+        let yolo_args = maintenance_command(
+            Path::new("/generation/bin/codex"),
+            Path::new("/repair/worktree"),
+            "repair this",
+            true,
+        )
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+        assert_eq!(
+            yolo_args,
+            "-c check_for_update_on_startup=false -C /repair/worktree \
+             --dangerously-bypass-approvals-and-sandbox --no-alt-screen repair this"
         );
         let prompt = generate_repair_prompt(&RepairPromptContext {
             failure_id: "failure-1".into(),
@@ -1882,6 +1929,8 @@ mod tests {
             "Do not invoke codex-patcher",
             "Do not commit",
             "Remove every .rej file",
+            "focused offline checks",
+            "authoritative package rebuild",
         ] {
             assert!(prompt.contains(required));
         }

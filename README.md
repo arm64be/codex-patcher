@@ -86,10 +86,13 @@ There is no daemon or watcher. A wrapped `codex` launch does three small things:
 
 Patch edits and upstream changes are therefore acted on by the same launch that
 detects them. An ordinary warm launch reads the small state, config, and patch
-inputs but does not parse the upstream HTTP cache or rewrite state. If GitHub is
-temporarily unreachable when revalidation is due, the launch uses the last
-trusted cached response and waits briefly before retrying; a local patch change
-can still rebuild against the active Codex source.
+inputs but does not parse the upstream HTTP cache, perform network I/O, or
+rewrite state; this path is intended to add only a few milliseconds before
+Codex starts. When the polling floor expires, authoritative GitHub revalidation
+is synchronous and can take up to the three-second network budget. If GitHub is
+temporarily unreachable, the launch uses the last trusted cached response and
+waits briefly before retrying; a local patch change can still rebuild against
+the active Codex source.
 
 Interactive launches show a Codex-style prompt for source or configuration
 changes that are not eligible for automatic patch rebuilding. Service,
@@ -135,7 +138,12 @@ compare-and-swap checks, so drifted paths are reported instead of overwritten.
 
 `repair [FAILURE_ID]` recreates the failed source and patch stack in a temporary
 worktree, launches the pinned last-good Codex for a repair pass, rebuilds the
-result, and shows every patch-file change before confirmation.
+result, and shows every patch-file change before confirmation. The generated
+repair instructions are passed directly as that Codex process's initial
+positional prompt; terminal input is not synthesized and stdio remains attached.
+Repairs started by a managed Codex launch explicitly using `--yolo` or
+`--dangerously-bypass-approvals-and-sandbox` inherit that mode. All other repair
+sessions use a `workspace-write` sandbox with approval on request.
 
 `uninstall --yes` restores unchanged baselines and removes patcher state only
 when no build or generation lease is active.

@@ -97,6 +97,7 @@ fn cached_synchronous_freshness_check_keeps_launch_fast() {
     let fixture = DispatcherFixture::new("error", "error");
     fs::write(fixture.paths.remote_cache_file(), b"not valid JSON")
         .expect("poison remote cache that a warm launch must not parse");
+    let state_before = fs::read(fixture.paths.state_file()).expect("read warm state");
     let started = Instant::now();
     let output = fixture.run(["app-server"], |command| {
         command.env("CODEX_PATCHER_TEST_STDOUT", "ready\n");
@@ -105,8 +106,13 @@ fn cached_synchronous_freshness_check_keeps_launch_fast() {
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"ready\n");
+    assert_eq!(
+        fs::read(fixture.paths.state_file()).expect("reread warm state"),
+        state_before,
+        "a cached launch should not rewrite durable state"
+    );
     assert!(
-        launch_time < Duration::from_secs(2),
+        launch_time < Duration::from_millis(250),
         "launch spent {launch_time:?} on cached freshness work"
     );
 }

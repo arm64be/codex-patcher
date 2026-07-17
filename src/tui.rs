@@ -767,6 +767,7 @@ fn progress_log_line(value: &str, options: RenderOptions) -> Line<'static> {
     let value = sanitize_line(value);
     let trimmed = value.trim_start();
     for (prefix, color) in [
+        ("Applying", Color::Green),
         ("Compiling", Color::Green),
         ("Checking", Color::Green),
         ("Finished", Color::Green),
@@ -778,6 +779,8 @@ fn progress_log_line(value: &str, options: RenderOptions) -> Line<'static> {
         ("Adding", Color::Green),
         ("Removing", Color::Red),
         ("Downgrading", Color::Yellow),
+        ("Profile", Color::Green),
+        ("Cache", Color::Green),
     ] {
         if let Some(rest) = trimmed.strip_prefix(prefix)
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -858,6 +861,7 @@ fn concise_duration(seconds: u64) -> String {
 fn compact_progress_line(value: &str) -> String {
     let trimmed = value.trim_start();
     let cargo_status = [
+        "Applying",
         "Compiling",
         "Checking",
         "Finished",
@@ -1112,6 +1116,15 @@ mod tests {
         };
         let compiling = progress_log_line("   Compiling rcgen v0.14.7", options);
         assert_eq!(compiling.spans[0].style.fg, Some(Color::Green));
+        let applying = progress_log_line("Applying 1/2 fixes.patch", options);
+        assert_eq!(applying.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(applying.spans[0].content.trim(), "Applying");
+        let profile = progress_log_line("Profile dev-small (incremental, no LTO)", options);
+        assert_eq!(profile.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(profile.spans[0].content.trim(), "Profile");
+        let cache = progress_log_line("Cache warm (reusing compiler artifacts)", options);
+        assert_eq!(cache.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(cache.spans[0].content.trim(), "Cache");
         let warning = progress_log_line("warning: generated one warning", options);
         assert_eq!(warning.spans[1].style.fg, Some(Color::Yellow));
         let error = progress_log_line("error[E0463]: missing core", options);
