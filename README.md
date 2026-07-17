@@ -33,13 +33,15 @@ Put `codex-patcher.toml` next to your patch files:
 ```toml
 schema = 1
 branch = "stable"
-target = "official-native"
+target = "native"
 failure_mode = "error"
 noninteractive_pending = "auto"
 ```
 
 `branch` can be `stable`, `alpha`, or `nightly`. `target` is
-`official-native` or a supported same-host target triple.
+`native` or a supported same-host target triple. On Linux, `native` uses the
+host's normal GNU ABI; choose a `*-musl` triple explicitly only when its Rust
+target and native build tools are installed.
 
 `failure_mode` controls what happens when a build fails:
 

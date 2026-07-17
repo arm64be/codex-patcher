@@ -1,5 +1,5 @@
 use crate::patchset::PatchSet;
-use crate::paths::PatcherPaths;
+use crate::paths::{PatcherPaths, display_user_path};
 use crate::state::atomic_write;
 use crate::types::{DesiredBuild, FileHash, GenerationManifest, GenerationRef};
 use crate::{STATE_SCHEMA, UPSTREAM_REPOSITORY};
@@ -21,6 +21,7 @@ use wait_timeout::ChildExt;
 use walkdir::WalkDir;
 
 const CARGO_PROFILE: &str = "release";
+const MAX_FAILURE_LOG_TAIL: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum BuildEvent {
@@ -28,8 +29,7 @@ pub enum BuildEvent {
     Line(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{phase}: {summary}")]
+#[derive(Debug)]
 pub struct BuildFailure {
     pub phase: String,
     pub summary: String,
@@ -40,6 +40,20 @@ pub struct BuildFailure {
     pub failed_patch: Option<String>,
     pub log_path: PathBuf,
 }
+
+impl std::fmt::Display for BuildFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} (details: {})",
+            self.phase,
+            self.summary,
+            display_user_path(&self.log_path)
+        )
+    }
+}
+
+impl std::error::Error for BuildFailure {}
 
 impl BuildFailure {
     fn new(phase: impl Into<String>, error: impl std::fmt::Display, log_path: &Path) -> Self {
@@ -66,9 +80,8 @@ fn transient_network_failure(phase: &str, summary: &str, log_path: &Path) -> boo
     if !matches!(phase, "resolve" | "build") {
         return false;
     }
-    const MAX_LOG_TAIL: usize = 64 * 1024;
     let log = fs::read(log_path).unwrap_or_default();
-    let tail = &log[log.len().saturating_sub(MAX_LOG_TAIL)..];
+    let tail = &log[log.len().saturating_sub(MAX_FAILURE_LOG_TAIL)..];
     let text = format!("{summary}\n{}", String::from_utf8_lossy(tail)).to_ascii_lowercase();
     [
         "could not resolve host",
@@ -93,6 +106,29 @@ fn transient_network_failure(phase: &str, summary: &str, log_path: &Path) -> boo
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn package_builder_failure_summary(status: &ExitStatus, target: &str, log_path: &Path) -> String {
+    package_builder_log_diagnostic(target, log_path)
+        .unwrap_or_else(|| format!("package builder exited with {status}"))
+}
+
+fn package_builder_log_diagnostic(target: &str, log_path: &Path) -> Option<String> {
+    let log = fs::read(log_path).ok()?;
+    let tail = &log[log.len().saturating_sub(MAX_FAILURE_LOG_TAIL)..];
+    let text = String::from_utf8_lossy(tail);
+    let folded = text.to_ascii_lowercase();
+    if folded.contains("can't find crate for `core`")
+        && folded.contains("target may not be installed")
+    {
+        return Some(format!(
+            "Rust target {target} is not installed for Codex's pinned toolchain"
+        ));
+    }
+    text.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error:") || line.starts_with("error["))
+        .map(|line| format!("package builder failed: {}", sanitize_line(line)))
 }
 
 #[derive(Default)]
@@ -323,7 +359,7 @@ fn build_generation_inner(
     if !status.success() {
         return Err(anyhow!(BuildFailure::new(
             "build",
-            format!("package builder exited with {status}"),
+            package_builder_failure_summary(&status, &desired.target, log_path),
             log_path
         )));
     }
@@ -1154,6 +1190,34 @@ mod tests {
 
         fs::write(temp.path(), b"error[E0308]: mismatched types\n").unwrap();
         assert!(!BuildFailure::new("build", "builder failed", temp.path()).transient);
+    }
+
+    #[test]
+    fn package_builder_failures_surface_the_first_useful_diagnostic() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            temp.path(),
+            b"error[E0463]: can't find crate for `core`\n\
+              = note: the `x86_64-unknown-linux-musl` target may not be installed\n\
+              error: could not compile `cfg-if`\n",
+        )
+        .unwrap();
+        assert_eq!(
+            package_builder_log_diagnostic("x86_64-unknown-linux-musl", temp.path()).as_deref(),
+            Some(
+                "Rust target x86_64-unknown-linux-musl is not installed for Codex's pinned toolchain"
+            )
+        );
+
+        fs::write(
+            temp.path(),
+            b"warning: noisy\nerror: linking with `cc` failed\nTraceback (most recent call last)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            package_builder_log_diagnostic("x86_64-unknown-linux-gnu", temp.path()).as_deref(),
+            Some("package builder failed: error: linking with `cc` failed")
+        );
     }
 
     #[test]

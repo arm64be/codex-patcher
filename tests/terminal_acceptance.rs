@@ -7,6 +7,12 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy)]
+enum TerminalEvent {
+    CursorPositionQuery,
+    PromptReady,
+}
+
 #[test]
 fn interactive_update_restores_a_native_pty_or_conpty() {
     let fixture = DispatcherFixture::new("error", "error");
@@ -26,36 +32,54 @@ fn interactive_update_restores_a_native_pty_or_conpty() {
     let mut writer = pair.master.take_writer().unwrap();
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
-    let (prompt_ready, wait_for_prompt) = mpsc::channel();
+    let (terminal_event, wait_for_terminal) = mpsc::channel();
     let output = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
+        let mut cursor_queries_reported = 0;
         let mut prompt_reported = false;
         while let Ok(read) = reader.read(&mut buffer) {
             if read == 0 {
                 break;
             }
             bytes.extend_from_slice(&buffer[..read]);
+            let cursor_queries = bytes
+                .windows(b"\x1b[6n".len())
+                .filter(|window| *window == b"\x1b[6n")
+                .count();
+            while cursor_queries_reported < cursor_queries {
+                let _ = terminal_event.send(TerminalEvent::CursorPositionQuery);
+                cursor_queries_reported += 1;
+            }
             if !prompt_reported
                 && bytes
                     .windows(b"Update available!".len())
                     .any(|window| window == b"Update available!")
             {
-                let _ = prompt_ready.send(());
+                let _ = terminal_event.send(TerminalEvent::PromptReady);
                 prompt_reported = true;
             }
         }
         bytes
     });
-    if wait_for_prompt
-        .recv_timeout(Duration::from_secs(10))
-        .is_err()
-    {
-        let _ = child.kill();
-        drop(writer);
-        drop(pair.master);
-        let output = String::from_utf8_lossy(&output.join().unwrap()).into_owned();
-        panic!("interactive update prompt was not ready: {output:?}");
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match wait_for_terminal
+            .recv_timeout(prompt_deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(TerminalEvent::CursorPositionQuery) => {
+                writer.write_all(b"\x1b[1;1R").unwrap();
+                writer.flush().unwrap();
+            }
+            Ok(TerminalEvent::PromptReady) => break,
+            Err(_) => {
+                let _ = child.kill();
+                drop(writer);
+                drop(pair.master);
+                let output = String::from_utf8_lossy(&output.join().unwrap()).into_owned();
+                panic!("interactive update prompt was not ready: {output:?}");
+            }
+        }
     }
     writer.write_all(b"2").unwrap();
     writer.flush().unwrap();

@@ -1,10 +1,59 @@
 use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const PATCHER_HOME_ENV: &str = "CODEX_PATCHER_HOME";
+
+pub fn display_user_path(path: &Path) -> String {
+    BaseDirs::new()
+        .map(|directories| display_user_path_with_home(path, directories.home_dir()))
+        .unwrap_or_else(|| plain_path_display(path))
+}
+
+fn display_user_path_with_home(path: &Path, home: &Path) -> String {
+    #[cfg(not(windows))]
+    if let Ok(relative) = path.strip_prefix(home) {
+        return if relative.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            Path::new("~").join(relative).display().to_string()
+        };
+    }
+
+    let rendered = plain_path_display(path);
+    #[cfg(windows)]
+    {
+        let home = plain_path_display(home);
+        let rendered_folded = rendered.to_ascii_lowercase();
+        let home_folded = home.to_ascii_lowercase();
+        if rendered_folded == home_folded {
+            return "~".to_owned();
+        }
+        let suffix = &rendered[home.len().min(rendered.len())..];
+        if rendered_folded.starts_with(&home_folded)
+            && (suffix.starts_with('\\') || suffix.starts_with('/'))
+        {
+            return format!("~{}", &rendered[home.len()..]);
+        }
+    }
+    rendered
+}
+
+fn plain_path_display(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+            return rest.to_owned();
+        }
+    }
+    rendered
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatcherPaths {
@@ -202,6 +251,30 @@ pub const fn manager_file_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_under_home_are_compact_for_display() {
+        #[cfg(unix)]
+        let (home, child) = (
+            Path::new("/home/example"),
+            Path::new("/home/example/.codex/codex-patcher"),
+        );
+        #[cfg(windows)]
+        let (home, child) = (
+            Path::new(r"C:\Users\example"),
+            Path::new(r"\\?\C:\Users\example\.codex\codex-patcher"),
+        );
+
+        assert_eq!(display_user_path_with_home(home, home), "~");
+        assert_eq!(
+            display_user_path_with_home(child, home),
+            Path::new("~")
+                .join(".codex")
+                .join("codex-patcher")
+                .display()
+                .to_string()
+        );
+    }
 
     #[test]
     fn ensure_creates_the_layout_but_not_state_files() {

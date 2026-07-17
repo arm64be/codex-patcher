@@ -45,7 +45,7 @@ impl DispatcherFixture {
         fs::write(
             patch_dir.join("codex-patcher.toml"),
             format!(
-                "schema = 1\nbranch = \"stable\"\ntarget = \"official-native\"\nfailure_mode = \"{failure_mode}\"\nnoninteractive_pending = \"{noninteractive_pending}\"\n"
+                "schema = 1\nbranch = \"stable\"\ntarget = \"native\"\nfailure_mode = \"{failure_mode}\"\nnoninteractive_pending = \"{noninteractive_pending}\"\n"
             ),
         )
         .expect("write test config");

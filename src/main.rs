@@ -10,7 +10,7 @@ use codex_patcher::dispatch::{
 };
 use codex_patcher::elevation;
 use codex_patcher::patchset::PatchSet;
-use codex_patcher::paths::PatcherPaths;
+use codex_patcher::paths::{PatcherPaths, display_user_path};
 use codex_patcher::probe;
 use codex_patcher::repair;
 use codex_patcher::shim::{
@@ -159,7 +159,7 @@ fn real_main() -> Result<()> {
 
 const QUICKSTART_CONFIG: &str = r#"schema = 1
 branch = "stable"
-target = "official-native"
+target = "native"
 failure_mode = "error"
 noninteractive_pending = "auto"
 "#;
@@ -343,16 +343,9 @@ fn install(
             SurfaceOwner::Standalone | SurfaceOwner::Desktop | SurfaceOwner::Daemon
         )
     });
-    let mut warned_owner_paths = HashSet::new();
-    for candidate in selected_candidates.iter().filter(|candidate| {
-        candidate.redirectability == Redirectability::OwnerManaged
-            && warned_owner_paths.insert(candidate.raw.clone())
-    }) {
-        eprintln!(
-            "Warning: {} is maintained by {}; its updater can replace the dispatcher. Run `codex-patcher repair-shims` if that happens.",
-            display_user_path(&candidate.raw),
-            update_method_display(candidate.update_method)
-        );
+    if owner_managed_selected {
+        eprintln!("\nCodex updates may replace one or more of these launchers.");
+        eprintln!("If that happens, run `codex-patcher repair-shims`.");
     }
     let updater_plan = if system_updater_owner_selected {
         inspect_codex_update_manager(Duration::from_secs(8))?
@@ -360,23 +353,26 @@ fn install(
         None
     };
     if let Some(updater) = updater_plan.as_ref() {
-        eprintln!(
-            "Updater collateral: {} is load={} enabled={} active={}",
-            updater.unit, updater.load_state, updater.enabled_state, updater.active_state
-        );
-        if updater.stop_intended {
-            eprintln!("  installation will stop this user service after the build validates");
-        }
-        if updater.disable_intended {
-            eprintln!("  installation will disable this user service after the build validates");
+        if updater.stop_intended || updater.disable_intended {
+            let status = match (updater.stop_intended, updater.disable_intended) {
+                (true, true) => "running and enabled",
+                (true, false) => "running",
+                (false, true) => "enabled",
+                (false, false) => unreachable!(),
+            };
+            let action = match (updater.stop_intended, updater.disable_intended) {
+                (true, true) => "stop and disable",
+                (true, false) => "stop",
+                (false, true) => "disable",
+                (false, false) => unreachable!(),
+            };
+            eprintln!("\nCodex's background updater is {status}.");
+            eprintln!("After the first build succeeds, codex-patcher will {action} it.");
+            eprintln!("Uninstall restores its previous state.");
         }
         for note in &updater.notes {
-            eprintln!("  warning: {note}");
+            eprintln!("Note: {note}");
         }
-    } else if owner_managed_selected {
-        eprintln!(
-            "WARNING: no reversible updater adapter covers every selected owner-managed surface"
-        );
     }
     if !yes
         && !Confirm::with_theme(&ColorfulTheme::default())
@@ -646,6 +642,7 @@ fn select_surfaces(
         .with_prompt("Select Codex launchers to manage")
         .items(&labels)
         .defaults(&defaults)
+        .report(false)
         .interact()?;
     deduplicate_surface_paths(
         selected
@@ -1365,55 +1362,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn display_user_path(path: &Path) -> String {
-    BaseDirs::new()
-        .map(|directories| display_user_path_with_home(path, directories.home_dir()))
-        .unwrap_or_else(|| plain_path_display(path))
-}
-
-fn display_user_path_with_home(path: &Path, home: &Path) -> String {
-    #[cfg(not(windows))]
-    if let Ok(relative) = path.strip_prefix(home) {
-        return if relative.as_os_str().is_empty() {
-            "~".to_owned()
-        } else {
-            Path::new("~").join(relative).display().to_string()
-        };
-    }
-
-    let rendered = plain_path_display(path);
-    #[cfg(windows)]
-    {
-        let home = plain_path_display(home);
-        let rendered_folded = rendered.to_ascii_lowercase();
-        let home_folded = home.to_ascii_lowercase();
-        if rendered_folded == home_folded {
-            return "~".to_owned();
-        }
-        let suffix = &rendered[home.len().min(rendered.len())..];
-        if rendered_folded.starts_with(&home_folded)
-            && (suffix.starts_with('\\') || suffix.starts_with('/'))
-        {
-            return format!("~{}", &rendered[home.len()..]);
-        }
-    }
-    rendered
-}
-
-fn plain_path_display(path: &Path) -> String {
-    let rendered = path.display().to_string();
-    #[cfg(windows)]
-    {
-        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
-        }
-        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
-            return rest.to_owned();
-        }
-    }
-    rendered
-}
-
 fn terminal_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -1442,30 +1390,6 @@ mod tests {
             Some(bin.canonicalize().unwrap().as_path())
         );
         assert_eq!(selected[0].file_name(), Some(std::ffi::OsStr::new("codex")));
-    }
-
-    #[test]
-    fn paths_under_home_are_compact_for_display() {
-        #[cfg(unix)]
-        let (home, child) = (
-            Path::new("/home/example"),
-            Path::new("/home/example/.codex/codex-patcher"),
-        );
-        #[cfg(windows)]
-        let (home, child) = (
-            Path::new(r"C:\Users\example"),
-            Path::new(r"\\?\C:\Users\example\.codex\codex-patcher"),
-        );
-
-        assert_eq!(display_user_path_with_home(home, home), "~");
-        assert_eq!(
-            display_user_path_with_home(child, home),
-            Path::new("~")
-                .join(".codex")
-                .join("codex-patcher")
-                .display()
-                .to_string()
-        );
     }
 
     #[cfg(unix)]

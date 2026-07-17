@@ -54,7 +54,7 @@ impl Serialize for TargetSpec {
         S: Serializer,
     {
         match self {
-            Self::OfficialNative => serializer.serialize_str("official-native"),
+            Self::OfficialNative => serializer.serialize_str("native"),
             Self::Triple(target) => serializer.serialize_str(target),
         }
     }
@@ -66,7 +66,7 @@ impl<'de> Deserialize<'de> for TargetSpec {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        if value == "official-native" {
+        if matches!(value.as_str(), "native" | "official-native") {
             Ok(Self::OfficialNative)
         } else {
             validate_target(&value).map_err(serde::de::Error::custom)?;
@@ -194,11 +194,11 @@ pub fn resolve_host_target(os: &str, arch: &str) -> Result<&'static str> {
 fn targets_for_host(os: &str, arch: &str) -> Result<(&'static str, &'static [&'static str])> {
     match (os, arch) {
         ("linux", "x86_64") => Ok((
-            "x86_64-unknown-linux-musl",
+            "x86_64-unknown-linux-gnu",
             &["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"],
         )),
         ("linux", "aarch64") => Ok((
-            "aarch64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
             &["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"],
         )),
         ("macos", "x86_64") => Ok(("x86_64-apple-darwin", &["x86_64-apple-darwin"])),
@@ -234,11 +234,13 @@ mod tests {
             toml::from_str("schema=1\nbranch=\"stable\"\nnoninteractive_pending=\"auto\"").unwrap();
         assert_eq!(minimal.target, TargetSpec::OfficialNative);
         assert_eq!(minimal.failure_mode, FailureMode::Error);
-        assert!(
-            toml::to_string(&minimal)
-                .unwrap()
-                .contains("official-native")
-        );
+        assert!(toml::to_string(&minimal).unwrap().contains("native"));
+        let legacy: Config = toml::from_str(
+            "schema=1\nbranch=\"stable\"\ntarget=\"official-native\"\n\
+             noninteractive_pending=\"auto\"",
+        )
+        .unwrap();
+        assert_eq!(legacy.target, TargetSpec::OfficialNative);
         assert!(
             toml::from_str::<Config>(
                 "schema=1\nbranch=\"stable\"\nnoninteractive_pending=\"auto\"\nmystery=true"
@@ -254,7 +256,7 @@ mod tests {
     fn host_mapping_and_explicit_targets_are_native_only() {
         assert_eq!(
             resolve_host_target("linux", "x86_64").unwrap(),
-            "x86_64-unknown-linux-musl"
+            "x86_64-unknown-linux-gnu"
         );
         assert_eq!(
             resolve_host_target("macos", "aarch64").unwrap(),
